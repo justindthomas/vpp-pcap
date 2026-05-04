@@ -29,12 +29,19 @@
 static int
 compile_filter (pcap_stream_session_t *s, const char *expr, char **err_msg)
 {
+  /* Compile both DLT_EN10MB and DLT_RAW programs (eth required,
+   * raw best-effort for the future drop tap). Both go through
+   * pcap_compile_nopcap which doesn't have the pcap_t lifecycle
+   * issue that crashed VPP on the second compile in the
+   * pcap_open_dead/pcap_close pattern. */
   s->bpf_eth = pcap_filter_compile (expr, PCAP_FILTER_DLT_EN10MB,
 				    PCAP_STREAM_MAX_SNAPLEN, err_msg);
   if (!s->bpf_eth)
     return -1;
-  /* Best-effort raw-side compile. Discard any error — it's expected
-   * for ethernet-only filters. */
+  /* Best-effort raw-side compile. Discard any error — eth-only
+   * filters like `arp` and `ether host ..` can't compile against
+   * DLT_RAW, which just means drop-mode matching is silently
+   * disabled for that session. */
   char *raw_err = NULL;
   s->bpf_raw = pcap_filter_compile (expr, PCAP_FILTER_DLT_RAW,
 				    PCAP_STREAM_MAX_SNAPLEN, &raw_err);

@@ -17,55 +17,70 @@ struct pcap_filter_s
   struct bpf_program prog;
 };
 
+/* Long-lived dummy pcap_t handles, one per DLT. Created lazily on
+ * first compile, never closed. Reusing the same handle across
+ * compiles avoids the open/close cycle that breaks libpcap's
+ * internal state on Bookworm — pcap_compile() on the same handle
+ * works repeatedly; what fails is repeatedly opening and closing.
+ *
+ * Memory leak is bounded (one pcap_t per DLT, 2 DLTs total). */
+static pcap_t *g_pcap_eth = NULL;
+static pcap_t *g_pcap_raw = NULL;
+
 pcap_filter_t *
 pcap_filter_compile (const char *expr, int dlt, int snaplen, char **err)
 {
-  /* Translate our portable PCAP_FILTER_DLT_* sentinels to whatever
-   * the linked libpcap thinks DLT_EN10MB / DLT_RAW are. Hardcoding
-   * the wire values (1, 101) breaks because some libpcap builds
-   * remap DLT_RAW to a different number to deconflict the
-   * historic Linux-vs-BSD divergence (we hit "unknown data link
-   * type 101" on Bookworm's libpcap1.10). */
+  /* Translate our portable PCAP_FILTER_DLT_* sentinels to libpcap's
+   * actual DLT_EN10MB / DLT_RAW values, and pick the matching
+   * cached handle. */
   int real_dlt;
+  pcap_t **slot;
   switch (dlt)
     {
     case PCAP_FILTER_DLT_EN10MB:
       real_dlt = DLT_EN10MB;
+      slot = &g_pcap_eth;
       break;
     case PCAP_FILTER_DLT_RAW:
       real_dlt = DLT_RAW;
+      slot = &g_pcap_raw;
       break;
     default:
-      real_dlt = dlt;
-      break;
-    }
-  pcap_t *dummy = pcap_open_dead (real_dlt, snaplen);
-  if (!dummy)
-    {
       if (err)
-	*err = strdup ("pcap_open_dead failed");
+	*err = strdup ("unknown DLT");
       return NULL;
+    }
+
+  if (*slot == NULL)
+    {
+      *slot = pcap_open_dead (real_dlt, PCAP_FILTER_MAX_SNAPLEN);
+      if (*slot == NULL)
+	{
+	  if (err)
+	    *err = strdup ("pcap_open_dead failed");
+	  return NULL;
+	}
     }
 
   pcap_filter_t *f = calloc (1, sizeof (*f));
   if (!f)
     {
-      pcap_close (dummy);
       if (err)
 	*err = strdup ("calloc failed");
       return NULL;
     }
 
-  if (pcap_compile (dummy, &f->prog, expr, 1, PCAP_NETMASK_UNKNOWN) < 0)
+  /* Compile against the long-lived handle. Calling pcap_compile()
+   * many times on the SAME pcap_t works fine — what crashed VPP
+   * was repeatedly pcap_open_dead/pcap_close cycling. */
+  if (pcap_compile (*slot, &f->prog, expr, 1, PCAP_NETMASK_UNKNOWN) < 0)
     {
       if (err)
-	*err = strdup (pcap_geterr (dummy));
-      pcap_close (dummy);
+	*err = strdup (pcap_geterr (*slot));
       free (f);
       return NULL;
     }
-
-  pcap_close (dummy);
+  (void) snaplen; /* baked into the cached handle */
   return f;
 }
 

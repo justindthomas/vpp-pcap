@@ -27,6 +27,12 @@ typedef struct pcap_filter_s pcap_filter_t;
 #define PCAP_FILTER_DLT_EN10MB 1
 #define PCAP_FILTER_DLT_RAW    101
 
+/* Snaplen baked into the cached long-lived dummy pcap_t. Ceiling
+ * for the libpcap savefile format. We always compile against this
+ * max — actual per-session snaplen is enforced by the ring/copy
+ * code, not the BPF program. */
+#define PCAP_FILTER_MAX_SNAPLEN 65535
+
 /* Compile `expr` for the given DLT. Returns NULL on failure with
  * `*err` set to a malloc'd error string the caller must free. */
 pcap_filter_t *pcap_filter_compile (const char *expr, int dlt, int snaplen,
