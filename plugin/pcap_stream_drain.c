@@ -511,6 +511,24 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 	  return 0;
 	}
       s->data_fd = dup_fd;
+      /* Force the data socket BLOCKING (the dup inherits O_NONBLOCK
+       * from the accept). Two reasons:
+       *
+       * 1) writev() of header+payload must be atomic on the wire so
+       *    tcpdump and friends never see a per-packet header
+       *    without its bytes following — non-blocking would split.
+       *
+       * 2) When the consumer can't keep up (e.g. tcpdump -A -vvv at
+       *    1500-byte packets is CPU-bound), backpressure should
+       *    accumulate as drops on the per-worker ring, not as
+       *    truncated pcap streams.
+       *
+       * The cost is that a slow consumer can briefly stall the
+       * vlib_process drain — bounded by the kernel socket buffer
+       * and our drain tick, both fast. */
+      int flags = fcntl (dup_fd, F_GETFL, 0);
+      if (flags >= 0)
+	(void) fcntl (dup_fd, F_SETFL, flags & ~O_NONBLOCK);
       clib_file_t t = { 0 };
       t.read_function = data_socket_eof;
       t.error_function = data_socket_error;
@@ -766,24 +784,35 @@ drain_one_session (pcap_stream_session_t *s)
 	    .orig_len = rec->orig_len,
 	  };
 
-	  /* Two writes (header + payload). On EAGAIN we leave the
-	   * record in the ring and try again next tick. We must not
-	   * advance until both writes succeed atomically — but with
-	   * MSG_DONTWAIT a partial header write would corrupt the
-	   * pcap stream, so we use blocking writes here. The CLI
-	   * consumer is supposed to be a fast pipe; a stalled CLI
-	   * just slows the worker via ring backpressure (drops). */
-	  ssize_t n1 = send (s->data_fd, &h, sizeof (h), MSG_NOSIGNAL);
-	  if (n1 != (ssize_t) sizeof (h))
+	  /* Atomic header+payload write via sendmsg+iovec. The data
+	   * fd is blocking (set in create-session above), so a slow
+	   * consumer creates ring backpressure on the worker side
+	   * rather than a partial pcap record on the wire — tcpdump
+	   * et al never see a per-packet header without the bytes
+	   * that follow. MSG_NOSIGNAL suppresses SIGPIPE so a
+	   * disappeared consumer doesn't kill VPP. */
+	  struct iovec iov[2] = {
+	    { .iov_base = &h, .iov_len = sizeof (h) },
+	    { .iov_base = pcap_stream_record_data (rec),
+	      .iov_len = rec->len },
+	  };
+	  struct msghdr mh = {
+	    .msg_iov = iov,
+	    .msg_iovlen = 2,
+	  };
+	  ssize_t want = (ssize_t) sizeof (h) + (ssize_t) rec->len;
+	  ssize_t got;
+	  do
 	    {
-	      /* Connection broken — destroy session. */
-	      pcap_stream_session_destroy (s);
-	      return;
+	      got = sendmsg (s->data_fd, &mh, MSG_NOSIGNAL);
 	    }
-	  ssize_t n2 = send (s->data_fd, pcap_stream_record_data (rec),
-			     rec->len, MSG_NOSIGNAL);
-	  if (n2 != (ssize_t) rec->len)
+	  while (got < 0 && errno == EINTR);
+	  if (got != want)
 	    {
+	      /* EPIPE / ECONNRESET / short write — consumer gone,
+	       * tear down. The pcap stream up to this point is
+	       * clean since the previous record completed
+	       * atomically. */
 	      pcap_stream_session_destroy (s);
 	      return;
 	    }
