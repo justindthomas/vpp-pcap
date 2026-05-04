@@ -1,0 +1,17 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Justin Thomas */
+
+/* pcap_stream binary API.
+ *
+ * v0.1: empty — the plugin is driven entirely through the text
+ * control socket at /run/vpp/pcap-stream.sock. We declare a version
+ * message anyway so the plugin appears in `vppctl show api message`
+ * and can be recognised by binding generators.
+ *
+ * Future binary-API surface (probably): create_session,
+ * delete_session, list_sessions, get_session_stats. Driving these
+ * via vpp_papi from Python tooling is the main motivator for adding
+ * them later.
+ */
+
+option version = "0.1.0";

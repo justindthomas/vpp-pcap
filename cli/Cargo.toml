@@ -1,0 +1,22 @@
+[package]
+name = "vpp-pcap"
+version = "0.1.0"
+edition = "2021"
+description = "tcpdump-style live packet capture for FD.io VPP"
+license = "Apache-2.0"
+repository = "https://github.com/justindthomas/vpp-pcap"
+
+[[bin]]
+name = "vpp-pcap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
