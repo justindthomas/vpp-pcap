@@ -64,8 +64,12 @@ struct CaptureOpts {
     #[arg(short = 'd', long, default_value = "any")]
     direction: String,
 
-    /// Bytes per packet to capture (0 = full).
-    #[arg(short = 's', long, default_value_t = 262144)]
+    /// Bytes per packet to capture. Server clamps at 65535
+    /// (libpcap savefile max). The default of 4096 covers DNS,
+    /// BGP UPDATE, OSPF LSA payloads — bigger snaplens grow the
+    /// per-(session, worker) ring buffer linearly, so don't ask
+    /// for more than you'll inspect.
+    #[arg(short = 's', long, default_value_t = 4096)]
     snaplen: u32,
 
     /// Stop after N packets (0 = unlimited).

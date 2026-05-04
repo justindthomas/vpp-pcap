@@ -37,16 +37,31 @@
 #define PCAP_STREAM_MAX_SESSIONS 64
 
 /* Per-(session, worker) ring depth in records. SPSC, power of two.
- * 1024 records × ~1.5KB worst case = ~1.5MB per ring × 64 sessions ×
- * N workers worst case. Tune later if needed. */
-#define PCAP_STREAM_RING_LOG2_SIZE 10
+ * Was 1024 originally — combined with a fixed 64KB inline payload
+ * per record, that meant ~64MB per ring per worker. With multiple
+ * workers and a couple of sessions we exhausted VPP's heap and
+ * crashed (clib_mem_alloc_aligned → os_panic). 256 is plenty for
+ * operator-rate debugging; the drain runs every 1ms so we can
+ * absorb 256 packets between drains, well above the per-session
+ * stream rate the Unix socket can sustain. */
+#define PCAP_STREAM_RING_LOG2_SIZE 8
 #define PCAP_STREAM_RING_SIZE	  (1u << PCAP_STREAM_RING_LOG2_SIZE)
 #define PCAP_STREAM_RING_MASK	  (PCAP_STREAM_RING_SIZE - 1)
 
-/* Per-record max captured bytes. Records are fixed-size so the ring
- * stays cache-friendly; matches the libpcap savefile snaplen ceiling
- * for a "watch a wire" tool. Actual stored length is record->len. */
+/* Per-record max captured bytes. Records are *variable*-size — the
+ * payload buffer is allocated at session-create from the actual
+ * operator-requested snaplen, not this ceiling. This is a hard
+ * upper bound that bounds a single session's memory footprint
+ * even if the operator asks for something silly. 65535 is the
+ * libpcap savefile snaplen ceiling, so clipping here is no UX
+ * loss. */
 #define PCAP_STREAM_MAX_SNAPLEN 65535
+
+/* Default cap when the operator doesn't override. CLI default is
+ * "full packet" (262144) which gets clamped here. 4096 covers the
+ * 99% case (DNS payload, BGP UPDATE, OSPF LSA) without burning
+ * memory. Operator can request more via `-s <bytes>`. */
+#define PCAP_STREAM_DEFAULT_SNAPLEN 4096
 
 /* Direction filter — what the operator's `-d` argument selects. */
 typedef enum
@@ -58,11 +73,12 @@ typedef enum
 			PCAP_STREAM_DIR_DROP,
 } pcap_stream_direction_t;
 
-/* One captured-packet record sitting in a ring. The payload is
- * inline so the ring is one contiguous allocation per (session,
- * worker). `len` may be < snaplen if the original packet was
- * shorter; `orig_len` is the on-the-wire length so the consumer
- * can render the truncation indicator. */
+/* Captured-packet record header. The payload immediately follows
+ * the header in memory, sized at session-create from the operator's
+ * snaplen — see pcap_stream_record_data() to walk to it. `len` may
+ * be < snaplen if the original packet was shorter; `orig_len` is
+ * the on-the-wire length so the consumer can render the truncation
+ * indicator. */
 typedef struct
 {
   u64 ts_ns;	      /* CLOCK_REALTIME in ns */
@@ -71,14 +87,23 @@ typedef struct
   u32 len;	      /* bytes actually copied */
   u8 direction;	      /* pcap_stream_direction_t single bit */
   u8 _pad[3];
-  u8 data[PCAP_STREAM_MAX_SNAPLEN];
-} pcap_stream_record_t;
+  /* u8 payload[snaplen] follows immediately — access via
+   * pcap_stream_record_data(). */
+} pcap_stream_record_hdr_t;
 
 /* SPSC ring — one writer (a single VPP worker), one reader (the
  * main thread drain). head/tail are monotonically increasing
- * 64-bit counters; modulo masks them at access time. */
+ * 64-bit counters; modulo masks them at access time.
+ *
+ * Records are variable-stride: `record_stride` = sizeof(hdr) +
+ * snaplen, set at session-create. The records buffer follows the
+ * ring struct in memory (flexible array member) so the entire
+ * thing is one allocation. */
 typedef struct
 {
+  u32 record_stride; /* hdr + snaplen, bytes per slot */
+  u32 _pad0;
+
   CLIB_CACHE_LINE_ALIGN_MARK (head_pad);
   volatile u64 head; /* next slot the writer will fill */
 
@@ -86,8 +111,22 @@ typedef struct
   volatile u64 tail; /* next slot the reader will consume */
 
   CLIB_CACHE_LINE_ALIGN_MARK (data_pad);
-  pcap_stream_record_t records[PCAP_STREAM_RING_SIZE];
+  u8 records[]; /* PCAP_STREAM_RING_SIZE * record_stride bytes */
 } pcap_stream_ring_t;
+
+static_always_inline pcap_stream_record_hdr_t *
+pcap_stream_record_at (pcap_stream_ring_t *r, u64 seq)
+{
+  return (pcap_stream_record_hdr_t *) (r->records +
+				       (seq & PCAP_STREAM_RING_MASK) *
+					   r->record_stride);
+}
+
+static_always_inline u8 *
+pcap_stream_record_data (pcap_stream_record_hdr_t *rec)
+{
+  return (u8 *) (rec + 1);
+}
 
 /* One capture session. Holds the compiled BPF program, per-worker
  * rings, and the data socket fd that the main-thread drain is
@@ -201,21 +240,24 @@ pcap_stream_session_first_active (pcap_stream_main_t *psm)
 
 /* --- ring.c --- */
 
-pcap_stream_ring_t *pcap_stream_ring_alloc (void);
+/* Allocate a ring sized for the operator's snaplen. Returns NULL
+ * on alloc failure (caller must handle gracefully — don't panic
+ * VPP). */
+pcap_stream_ring_t *pcap_stream_ring_alloc (u32 snaplen);
 void pcap_stream_ring_free (pcap_stream_ring_t *r);
 
 /* Producer — return pointer to the next writable record, or NULL
  * if the ring is full. Caller fills the record then calls commit.
  * Single-writer per ring; no atomics on head besides the release-
  * store at commit time. */
-static_always_inline pcap_stream_record_t *
+static_always_inline pcap_stream_record_hdr_t *
 pcap_stream_ring_reserve (pcap_stream_ring_t *r)
 {
   u64 head = r->head;
   u64 tail = __atomic_load_n (&r->tail, __ATOMIC_ACQUIRE);
   if (head - tail >= PCAP_STREAM_RING_SIZE)
     return 0;
-  return &r->records[head & PCAP_STREAM_RING_MASK];
+  return pcap_stream_record_at (r, head);
 }
 
 static_always_inline void
@@ -226,14 +268,14 @@ pcap_stream_ring_commit (pcap_stream_ring_t *r)
 
 /* Consumer — main thread. Returns pointer to next-readable record
  * or NULL if empty. Caller copies out then calls advance. */
-static_always_inline pcap_stream_record_t *
+static_always_inline pcap_stream_record_hdr_t *
 pcap_stream_ring_peek (pcap_stream_ring_t *r)
 {
   u64 tail = r->tail;
   u64 head = __atomic_load_n (&r->head, __ATOMIC_ACQUIRE);
   if (tail == head)
     return 0;
-  return &r->records[tail & PCAP_STREAM_RING_MASK];
+  return pcap_stream_record_at (r, tail);
 }
 
 static_always_inline void

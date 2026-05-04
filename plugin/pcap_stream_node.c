@@ -121,7 +121,7 @@ pcap_stream_match_and_enqueue (vlib_main_t *vm, vlib_buffer_t *b,
 	continue;
 
       pcap_stream_ring_t *r = s->rings[thread_index];
-      pcap_stream_record_t *rec = pcap_stream_ring_reserve (r);
+      pcap_stream_record_hdr_t *rec = pcap_stream_ring_reserve (r);
       if (!rec)
 	{
 	  __atomic_fetch_add (&s->dropped, 1, __ATOMIC_RELAXED);
@@ -132,7 +132,7 @@ pcap_stream_match_and_enqueue (vlib_main_t *vm, vlib_buffer_t *b,
       rec->orig_len = orig_len;
       rec->len = first_seg_len < s->snaplen ? first_seg_len : s->snaplen;
       rec->direction = direction;
-      clib_memcpy_fast (rec->data, eth, rec->len);
+      clib_memcpy_fast (pcap_stream_record_data (rec), eth, rec->len);
       pcap_stream_ring_commit (r);
       matched++;
     }

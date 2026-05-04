@@ -622,7 +622,7 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 	  if (!pcap_filter_run (s->bpf_eth, payload, pl, pl))
 	    continue;
 	  pcap_stream_ring_t *r = s->rings[0]; /* main thread */
-	  pcap_stream_record_t *rec = pcap_stream_ring_reserve (r);
+	  pcap_stream_record_hdr_t *rec = pcap_stream_ring_reserve (r);
 	  if (!rec)
 	    {
 	      __atomic_fetch_add (&s->dropped, 1, __ATOMIC_RELAXED);
@@ -633,7 +633,7 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 	  rec->orig_len = pl;
 	  rec->len = pl < s->snaplen ? pl : s->snaplen;
 	  rec->direction = PCAP_STREAM_DIR_RX;
-	  clib_memcpy_fast (rec->data, payload, rec->len);
+	  clib_memcpy_fast (pcap_stream_record_data (rec), payload, rec->len);
 	  pcap_stream_ring_commit (r);
 	  injected++;
 	}
@@ -755,7 +755,7 @@ drain_one_session (pcap_stream_session_t *s)
 
       while (1)
 	{
-	  pcap_stream_record_t *rec = pcap_stream_ring_peek (r);
+	  pcap_stream_record_hdr_t *rec = pcap_stream_ring_peek (r);
 	  if (!rec)
 	    break;
 
@@ -780,7 +780,8 @@ drain_one_session (pcap_stream_session_t *s)
 	      pcap_stream_session_destroy (s);
 	      return;
 	    }
-	  ssize_t n2 = send (s->data_fd, rec->data, rec->len, MSG_NOSIGNAL);
+	  ssize_t n2 = send (s->data_fd, pcap_stream_record_data (rec),
+			     rec->len, MSG_NOSIGNAL);
 	  if (n2 != (ssize_t) rec->len)
 	    {
 	      pcap_stream_session_destroy (s);

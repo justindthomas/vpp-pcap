@@ -79,7 +79,7 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
 	continue;
 
       pcap_stream_ring_t *r = s->rings[thread_index];
-      pcap_stream_record_t *rec = pcap_stream_ring_reserve (r);
+      pcap_stream_record_hdr_t *rec = pcap_stream_ring_reserve (r);
       if (!rec)
 	{
 	  __atomic_fetch_add (&s->dropped, 1, __ATOMIC_RELAXED);
@@ -90,7 +90,7 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
       rec->orig_len = orig_len;
       rec->len = first_seg_len < s->snaplen ? first_seg_len : s->snaplen;
       rec->direction = PCAP_STREAM_DIR_DROP;
-      clib_memcpy_fast (rec->data, pkt, rec->len);
+      clib_memcpy_fast (pcap_stream_record_data (rec), pkt, rec->len);
       pcap_stream_ring_commit (r);
     }
   (void) e0; /* error code is logged by error-drop itself; we don't

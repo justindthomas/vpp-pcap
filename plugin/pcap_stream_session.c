@@ -118,7 +118,15 @@ pcap_stream_session_create (const char *filter_expr, u32 sw_if_index,
 
   *error_msg = 0;
 
-  if (snaplen == 0 || snaplen > PCAP_STREAM_MAX_SNAPLEN)
+  /* Clamp snaplen — 0 means "use default", > MAX is an over-ask
+   * we silently cap. The default (4096) covers the 99% case
+   * (DNS payloads, BGP UPDATEs, OSPF LSAs) without burning the
+   * memory that a full 65535-byte snaplen would. Operators who
+   * need full payloads can request up to PCAP_STREAM_MAX_SNAPLEN
+   * explicitly. */
+  if (snaplen == 0)
+    snaplen = PCAP_STREAM_DEFAULT_SNAPLEN;
+  if (snaplen > PCAP_STREAM_MAX_SNAPLEN)
     snaplen = PCAP_STREAM_MAX_SNAPLEN;
 
   /* Find a free slot. */
@@ -155,10 +163,29 @@ pcap_stream_session_create (const char *filter_expr, u32 sw_if_index,
 
   /* Allocate per-thread rings. We allocate one for every thread
    * including main, so the worker threads can blindly index by
-   * vm->thread_index without a bounds check. */
+   * vm->thread_index without a bounds check. The ring is sized
+   * for the operator's snaplen — see pcap_stream_ring_alloc.
+   * If any allocation fails (heap exhausted), tear down what we
+   * built and surface an error to the operator rather than
+   * panicking VPP. */
   vec_validate (s->rings, nthreads - 1);
   for (u32 i = 0; i < nthreads; i++)
-    s->rings[i] = pcap_stream_ring_alloc ();
+    {
+      s->rings[i] = pcap_stream_ring_alloc (snaplen);
+      if (!s->rings[i])
+	{
+	  *error_msg = strdup ("ring allocation failed (VPP heap exhausted)");
+	  /* Free what we managed before bailing. */
+	  for (u32 j = 0; j < i; j++)
+	    pcap_stream_ring_free (s->rings[j]);
+	  vec_free (s->rings);
+	  if (s->bpf_eth) pcap_filter_free (s->bpf_eth);
+	  if (s->bpf_raw) pcap_filter_free (s->bpf_raw);
+	  free (s->filter_expr);
+	  clib_memset (s, 0, sizeof (*s));
+	  return 0;
+	}
+    }
 
   s->active = 1;
   adjust_refcounts (s, 1);
