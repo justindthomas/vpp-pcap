@@ -10,6 +10,7 @@ add_vpp_plugin(pcap_stream
   pcap_stream_node.c
   pcap_stream_drop.c
   pcap_stream_api.c
+  pcap_stream_pcapng.c
   pcap_filter.c
   pcap_stream.h
   pcap_filter.h

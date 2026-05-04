@@ -688,22 +688,18 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
   return 0;
 }
 
-/* --- pcap framing --- */
+/* --- pcap-ng prelude --- */
 
 static void
 send_pcap_file_header (pcap_stream_session_t *s)
 {
-  pcap_stream_file_header_t h = {
-    .magic = PCAP_STREAM_MAGIC_NS,
-    .version_major = 2,
-    .version_minor = 4,
-    .thiszone = 0,
-    .sigfigs = 0,
-    .snaplen = s->snaplen,
-    .network = 1, /* DLT_EN10MB */
-  };
-  write_all (s->data_fd, &h, sizeof (h));
-  s->pcap_header_sent = 1;
+  /* Emit pcap-ng SHB followed by one IDB per HW/SUB interface.
+   * On error we leave pcap_header_sent = 0 and the drain loop
+   * skips this session — eventually the consumer will EOF and
+   * we tear down. */
+  pcap_stream_main_t *psm = &pcap_stream_main;
+  if (pcap_stream_pcapng_emit_prelude (s, psm->vnet_main) == 0)
+    s->pcap_header_sent = 1;
 }
 
 /* On data-socket EOF/error: tear the session down.
@@ -777,42 +773,14 @@ drain_one_session (pcap_stream_session_t *s)
 	  if (!rec)
 	    break;
 
-	  pcap_stream_pkt_header_t h = {
-	    .ts_sec = (u32) (rec->ts_ns / 1000000000ULL),
-	    .ts_nsec = (u32) (rec->ts_ns % 1000000000ULL),
-	    .incl_len = rec->len,
-	    .orig_len = rec->orig_len,
-	  };
-
-	  /* Atomic header+payload write via sendmsg+iovec. The data
-	   * fd is blocking (set in create-session above), so a slow
-	   * consumer creates ring backpressure on the worker side
-	   * rather than a partial pcap record on the wire — tcpdump
-	   * et al never see a per-packet header without the bytes
-	   * that follow. MSG_NOSIGNAL suppresses SIGPIPE so a
-	   * disappeared consumer doesn't kill VPP. */
-	  struct iovec iov[2] = {
-	    { .iov_base = &h, .iov_len = sizeof (h) },
-	    { .iov_base = pcap_stream_record_data (rec),
-	      .iov_len = rec->len },
-	  };
-	  struct msghdr mh = {
-	    .msg_iov = iov,
-	    .msg_iovlen = 2,
-	  };
-	  ssize_t want = (ssize_t) sizeof (h) + (ssize_t) rec->len;
-	  ssize_t got;
-	  do
+	  /* Emit one pcap-ng EPB tagged with the interface ID for
+	   * rec->sw_if_index. The pcap-ng emitter handles atomic
+	   * sendmsg + drop-on-no-IDB internally. EPIPE / short
+	   * write tears down the session. */
+	  if (pcap_stream_pcapng_emit_epb (s, rec->sw_if_index, rec->direction,
+					   rec->ts_ns, rec->len, rec->orig_len,
+					   pcap_stream_record_data (rec)) < 0)
 	    {
-	      got = sendmsg (s->data_fd, &mh, MSG_NOSIGNAL);
-	    }
-	  while (got < 0 && errno == EINTR);
-	  if (got != want)
-	    {
-	      /* EPIPE / ECONNRESET / short write — consumer gone,
-	       * tear down. The pcap stream up to this point is
-	       * clean since the previous record completed
-	       * atomically. */
 	      pcap_stream_session_destroy (s);
 	      return;
 	    }

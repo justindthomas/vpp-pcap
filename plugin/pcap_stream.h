@@ -157,10 +157,21 @@ typedef struct
   pcap_stream_ring_t **rings;	   /* vec[nthreads] */
 
   /* Data socket — main-thread end. The CLI connects, we write
-   * pcap file header + records. ~0 until CLI connects. */
+   * pcap-ng SHB + IDBs at session start, then EPB per matched
+   * packet. ~0 until CLI connects. */
   u32 data_file_index;	   /* clib_file_add return; ~0 = unset */
   int data_fd;
   u8 pcap_header_sent;
+
+  /* pcap-ng interface map. iface_id_to_sw is the IDB sequence we
+   * sent (vec[iface_id] = sw_if_index); sw_to_iface_id is the
+   * reverse for fast O(1) lookup at drain time
+   * (vec[sw_if_index] = iface_id, ~0 means "no IDB sent for this
+   * interface — packet dropped from output rather than emitted
+   * with a bad ID"). Built once at session start from the
+   * snapshot of vnm->interface_main.sw_interfaces. */
+  u32 *iface_id_to_sw;
+  u32 *sw_to_iface_id;
 
   /* Stats */
   u64 captured;	      /* records written to socket */
@@ -304,29 +315,40 @@ void pcap_stream_node_enable_all (u8 direction, int enable);
 
 void pcap_stream_drop_enable (int enable);
 
-/* --- shared utility --- */
+/* --- pcap-ng wire format --- */
 
-/* libpcap savefile header. Written once at the start of every
- * data-socket stream. Layout per the de-facto pcap format. */
-typedef struct
-{
-  u32 magic;	   /* 0xa1b2c3d4 = us, 0xa1b23c4d = ns */
-  u16 version_major;
-  u16 version_minor;
-  i32 thiszone;
-  u32 sigfigs;
-  u32 snaplen;
-  u32 network;	   /* DLT — 1 = EN10MB */
-} pcap_stream_file_header_t;
+/* Block types (RFC draft-tuexen-opsawg-pcapng-02 / current
+ * pcap-ng spec). We only emit SHB, IDB, and EPB. */
+#define PCAPNG_BT_SHB 0x0a0d0d0a
+#define PCAPNG_BT_IDB 0x00000001
+#define PCAPNG_BT_EPB 0x00000006
 
-#define PCAP_STREAM_MAGIC_NS 0xa1b23c4d
+#define PCAPNG_SHB_BYTE_ORDER_MAGIC 0x1a2b3c4d
+#define PCAPNG_VERSION_MAJOR 1
+#define PCAPNG_VERSION_MINOR 0
 
-typedef struct
-{
-  u32 ts_sec;
-  u32 ts_nsec;
-  u32 incl_len;	   /* bytes in this record */
-  u32 orig_len;	   /* on-the-wire length */
-} pcap_stream_pkt_header_t;
+/* Option codes */
+#define PCAPNG_OPT_ENDOFOPT 0
+#define PCAPNG_IDB_OPT_NAME 2 /* if_name string */
+#define PCAPNG_IDB_OPT_TSRESOL 9 /* timestamp resolution */
+#define PCAPNG_EPB_OPT_FLAGS 2 /* direction + reception type */
+
+/* EPB flags: bits 0-1 = direction, 1=in, 2=out */
+#define PCAPNG_EPB_FLAGS_IN  0x00000001
+#define PCAPNG_EPB_FLAGS_OUT 0x00000002
+
+/* Emit pcap-ng prelude (SHB + one IDB per interface) on the
+ * session's data fd. Builds s->iface_id_to_sw / sw_to_iface_id
+ * tables. Returns 0 on success, -1 if any write fails. */
+int pcap_stream_pcapng_emit_prelude (pcap_stream_session_t *s,
+				     vnet_main_t *vnm);
+
+/* Emit one EPB. Header + packet bytes + options + trailer go out
+ * atomically via sendmsg. iface_id is looked up from
+ * s->sw_to_iface_id; if not present, the EPB is skipped (caller
+ * decides to drop or fall back). */
+int pcap_stream_pcapng_emit_epb (pcap_stream_session_t *s, u32 sw_if_index,
+				 u8 direction, u64 ts_ns, u32 caplen,
+				 u32 orig_len, const u8 *pkt);
 
 #endif /* __included_pcap_stream_h__ */

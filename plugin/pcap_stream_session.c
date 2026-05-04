@@ -238,6 +238,9 @@ pcap_stream_session_destroy (pcap_stream_session_t *s)
       s->bpf_raw = NULL;
     }
 
+  vec_free (s->iface_id_to_sw);
+  vec_free (s->sw_to_iface_id);
+
   for (u32 i = 0; i < vec_len (s->rings); i++)
     pcap_stream_ring_free (s->rings[i]);
   vec_free (s->rings);

@@ -251,16 +251,44 @@ fn cmd_capture(sock: &PathBuf, opts: CaptureOpts) -> Result<()> {
         bail!("server: {resp}");
     }
 
-    // Pick the output sink.
+    // Pick the output sink. For --print we prefer `tshark` over
+    // `tcpdump` because the wire format is now pcap-ng with per-
+    // packet interface names + direction in IDBs/EPBs — tcpdump
+    // 4.99 (Bookworm) doesn't surface those in its default output,
+    // tshark does. Falls back to tcpdump if tshark isn't installed.
     let (mut sink, mut child): (Box<dyn Write>, Option<std::process::Child>) =
         if opts.print {
-            // pipe through tcpdump
-            let mut c = Command::new("tcpdump")
-                .args(["-nn", "-r", "-"])
+            let (cmd_name, cmd_args): (&str, Vec<&str>) =
+                if which::which("tshark").is_ok() {
+                    // tshark with custom fields — gives VyOS-like
+                    // "iface dir time src → dst proto info" output.
+                    // -l = line buffered, -t ad = absolute date+time,
+                    // -nN = no name resolution (-N defaults to none),
+                    // -T fields with explicit column set.
+                    ("tshark", vec![
+                        "-r", "-",
+                        "-l",
+                        "-t", "ad",
+                        "-n",
+                        "-T", "fields",
+                        "-E", "separator=\t",
+                        "-e", "frame.time",
+                        "-e", "frame.interface_name",
+                        "-e", "frame.packet_flags_direction",
+                        "-e", "_ws.col.Source",
+                        "-e", "_ws.col.Destination",
+                        "-e", "_ws.col.Protocol",
+                        "-e", "_ws.col.Info",
+                    ])
+                } else {
+                    ("tcpdump", vec!["-nn", "-r", "-"])
+                };
+            let mut c = Command::new(cmd_name)
+                .args(&cmd_args)
                 .stdin(Stdio::piped())
                 .spawn()
-                .context("spawn `tcpdump -nn -r -`")?;
-            let stdin = c.stdin.take().ok_or_else(|| anyhow!("tcpdump stdin"))?;
+                .with_context(|| format!("spawn `{cmd_name}`"))?;
+            let stdin = c.stdin.take().ok_or_else(|| anyhow!("{cmd_name} stdin"))?;
             (Box::new(stdin), Some(c))
         } else {
             match opts.write.as_deref() {
