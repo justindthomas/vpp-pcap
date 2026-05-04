@@ -20,8 +20,6 @@
 #include <vnet/vnet.h>
 #include <pcap_stream/pcap_stream.h>
 
-#include <pcap/pcap.h>
-
 #ifdef HAVE_VLIB_DROP_CALLBACK
 extern void vlib_drop_callback_register (
     void (*fn) (vlib_main_t *, vlib_buffer_t *, u64));
@@ -58,7 +56,6 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
    * fraction of the L3/L4 pipeline, so b->current_data may not
    * point at the ethernet header anymore. Use DLT_RAW for the
    * filter — most drop reasons are L3+ anyway. */
-  struct pcap_pkthdr ph = { .caplen = first_seg_len, .len = orig_len };
   const u8 *pkt = vlib_buffer_get_current (b);
 
   struct timespec ts;
@@ -78,8 +75,7 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
       if (s->sw_if_index != ~0 && s->sw_if_index != sw_if_index)
 	continue;
 
-      if (s->bpf_compiled &&
-	  !pcap_offline_filter (&s->bpf_raw, &ph, pkt))
+      if (!pcap_filter_run (s->bpf_raw, pkt, first_seg_len, orig_len))
 	continue;
 
       pcap_stream_ring_t *r = s->rings[thread_index];

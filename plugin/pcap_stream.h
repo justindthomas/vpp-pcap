@@ -18,7 +18,7 @@
 #include <vppinfra/clib.h>
 #include <vppinfra/file.h>
 
-#include <pcap/pcap.h>
+#include "pcap_filter.h"
 
 #define PCAP_STREAM_PLUGIN_VERSION_MAJOR 0
 #define PCAP_STREAM_PLUGIN_VERSION_MINOR 1
@@ -104,12 +104,12 @@ typedef struct
   u64 max_packets;    /* 0 = unlimited */
 
   /* Compiled libpcap programs. The bpf_trace_filter trick: keep
-   * one program compiled against DLT_EN10MB and one against
-   * DLT_RAW so we can dispatch based on whether the buffer is
-   * pre- or post-ethernet. */
-  struct bpf_program bpf_eth;
-  struct bpf_program bpf_raw;
-  u8 bpf_compiled;
+   * one program compiled against DLT_EN10MB (for pre-strip RX/TX
+   * captures where the ethernet header is intact) and one against
+   * DLT_RAW (for the drop tap, where the buffer's current_data
+   * may have advanced past L2). NULL if no filter expression. */
+  pcap_filter_t *bpf_eth;
+  pcap_filter_t *bpf_raw;
   char *filter_expr;	  /* operator's original string */
 
   /* Per-worker rings. Indexed by vlib_thread_index — vec length
@@ -118,8 +118,8 @@ typedef struct
   pcap_stream_ring_t **rings;	   /* vec[nthreads] */
 
   /* Data socket — main-thread end. The CLI connects, we write
-   * pcap file header + records. -1 until CLI connects. */
-  clib_file_t *data_file;	   /* registered with file_main */
+   * pcap file header + records. ~0 until CLI connects. */
+  u32 data_file_index;	   /* clib_file_add return; ~0 = unset */
   int data_fd;
   u8 pcap_header_sent;
 
@@ -134,7 +134,7 @@ typedef struct
  * streaming a session). */
 typedef struct
 {
-  clib_file_t *file;
+  u32 file_index;     /* ~0 if the fd has been handed off to a session */
   int fd;
   u8 *rx_buf;	      /* accumulated bytes, line-delimited messages */
 } pcap_stream_control_client_t;
@@ -167,7 +167,7 @@ typedef struct
   /* Control socket */
   char *control_socket_path;
   int control_listen_fd;
-  clib_file_t *control_listen_file;
+  u32 control_listen_file_index;
   pcap_stream_control_client_t *control_clients; /* pool */
 
   /* Drain process — wakes periodically + on data-socket-writable */
@@ -256,6 +256,7 @@ void pcap_stream_drain_wake (void);
 
 void pcap_stream_node_enable_iface (u32 sw_if_index, u8 direction,
 				    int enable);
+void pcap_stream_node_enable_all (u8 direction, int enable);
 
 /* --- drop.c (task #4) --- */
 

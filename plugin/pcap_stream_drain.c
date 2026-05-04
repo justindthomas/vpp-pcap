@@ -2,6 +2,12 @@
  * Copyright (c) 2026 Justin Thomas
  */
 
+/* Need _GNU_SOURCE for accept4(). VPP's build doesn't define it
+ * by default for plugin TUs. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 /* pcap_stream_drain.c — control socket + main-thread drain process.
  *
  * Wire protocol (text, line-delimited, one message per request):
@@ -23,11 +29,13 @@
 
 #include <pcap_stream/pcap_stream.h>
 #include <vppinfra/file.h>
+#include <vlib/file.h>
 #include <vlib/unix/unix.h>
 
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
@@ -50,6 +58,7 @@ VLIB_REGISTER_NODE (pcap_stream_drain_node, static) = {
 static clib_error_t *control_listen_read (clib_file_t *uf);
 static clib_error_t *control_client_read (clib_file_t *uf);
 static clib_error_t *control_client_error (clib_file_t *uf);
+static clib_error_t *data_socket_eof (clib_file_t *uf);
 static clib_error_t *data_socket_error (clib_file_t *uf);
 static void control_client_close (pcap_stream_control_client_t *c);
 static void send_pcap_file_header (pcap_stream_session_t *s);
@@ -102,7 +111,7 @@ control_listen_setup (pcap_stream_main_t *psm)
   t.read_function = control_listen_read;
   t.file_descriptor = fd;
   t.description = format (0, "pcap-stream control listener");
-  psm->control_listen_file = clib_file_add (&file_main, &t);
+  psm->control_listen_file_index = clib_file_add (&file_main, &t);
 
   clib_warning ("pcap_stream: listening on %s", psm->control_socket_path);
   return 0;
@@ -156,6 +165,7 @@ control_listen_read (clib_file_t *uf)
       pcap_stream_control_client_t *c;
       pool_get_zero (psm->control_clients, c);
       c->fd = cfd;
+      c->file_index = ~0;
 
       clib_file_t t = { 0 };
       t.read_function = control_client_read;
@@ -163,7 +173,7 @@ control_listen_read (clib_file_t *uf)
       t.file_descriptor = cfd;
       t.private_data = c - psm->control_clients;
       t.description = format (0, "pcap-stream client fd=%d", cfd);
-      c->file = clib_file_add (&file_main, &t);
+      c->file_index = clib_file_add (&file_main, &t);
     }
 }
 
@@ -180,12 +190,15 @@ control_client_close (pcap_stream_control_client_t *c)
    * closes the fd; we must not double-close. The session destroy
    * path detects this by clearing data_file/data_fd before
    * returning here. */
-  if (c->file)
+  /* Same double-close avoidance as session_destroy — clib_file_del
+   * closes the fd, don't close again. */
+  if (c->file_index != ~0u)
     {
-      clib_file_del (&file_main, c->file);
-      c->file = 0;
+      clib_file_del_by_index (&file_main, c->file_index);
+      c->file_index = ~0;
+      c->fd = -1;
     }
-  if (c->fd >= 0)
+  else if (c->fd >= 0)
     {
       close (c->fd);
       c->fd = -1;
@@ -265,15 +278,16 @@ control_client_read (clib_file_t *uf)
 
       if (streaming)
 	{
-	  /* Take this fd off the control-client read path; it's now
-	   * owned by the session's data_file. */
-	  if (c->file)
+	  /* Tear down the control-client handle. The session has its
+	   * own dup'd fd for the data path, so this clib_file_del
+	   * closing c->fd is fine (and necessary — otherwise we
+	   * leak the kernel-side accept fd). */
+	  if (c->file_index != ~0u)
 	    {
-	      clib_file_del (&file_main, c->file);
-	      c->file = 0;
+	      clib_file_del_by_index (&file_main, c->file_index);
+	      c->file_index = ~0;
+	      c->fd = -1;
 	    }
-	  /* Don't close the fd — the session owns it now. */
-	  c->fd = -1;
 	  vec_free (c->rx_buf);
 	  pool_put (psm->control_clients, c);
 	  return 0;
@@ -324,18 +338,25 @@ respond (pcap_stream_control_client_t *c, const char *fmt, ...)
 
 /* --- minimal arg parser for "key=value key='quoted value' ..." --- */
 
-/* Returns pointer to value (mutated in-place — quotes stripped) or
- * NULL if the key isn't present. Caller does not free. */
+/* Returns a freshly malloc'd copy of the value for `key`, or NULL
+ * if the key isn't present. Caller MUST free.
+ *
+ * This used to mutate the input string by null-terminating at the
+ * value's end and returning an interior pointer, but that broke
+ * subsequent arg_get calls — they hit the embedded null and
+ * stopped scanning. Always allocating a new string is the simple
+ * correct fix; control messages are tiny and infrequent so the
+ * malloc cost is irrelevant. */
 static char *
-arg_get (char *line, const char *key)
+arg_get (const char *line, const char *key)
 {
   size_t klen = strlen (key);
-  char *p = line;
+  const char *p = line;
   while (*p)
     {
       while (*p == ' ' || *p == '\t')
 	p++;
-      char *kstart = p;
+      const char *kstart = p;
       while (*p && *p != '=' && *p != ' ' && *p != '\t')
 	p++;
       size_t kl = p - kstart;
@@ -346,8 +367,8 @@ arg_get (char *line, const char *key)
 	  continue;
 	}
       p++; /* skip = */
-      char *vstart;
-      char *vend;
+      const char *vstart;
+      const char *vend;
       if (*p == '\'' || *p == '"')
 	{
 	  char quote = *p++;
@@ -367,11 +388,16 @@ arg_get (char *line, const char *key)
 	}
       if (kl == klen && memcmp (kstart, key, klen) == 0)
 	{
-	  *vend = 0;
-	  return vstart;
+	  size_t vl = vend - vstart;
+	  char *out = malloc (vl + 1);
+	  if (!out)
+	    return NULL;
+	  memcpy (out, vstart, vl);
+	  out[vl] = 0;
+	  return out;
 	}
     }
-  return 0;
+  return NULL;
 }
 
 /* --- dispatch --- */
@@ -420,28 +446,33 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 
   if (!strcmp (verb, "create"))
     {
-      const char *iface_name = arg_get (rest, "iface");
-      const char *dir_str = arg_get (rest, "dir");
-      const char *snap_str = arg_get (rest, "snaplen");
-      const char *max_str = arg_get (rest, "max");
-      const char *filter_expr = arg_get (rest, "filter");
+      char *iface_name = arg_get (rest, "iface");
+      char *dir_str = arg_get (rest, "dir");
+      char *snap_str = arg_get (rest, "snaplen");
+      char *max_str = arg_get (rest, "max");
+      char *filter_expr = arg_get (rest, "filter");
 
       u32 sw_if_index = ~0;
       if (iface_name && strcmp (iface_name, "any") != 0)
 	{
+	  /* Use unformat_vnet_sw_interface so we accept ALL interface
+	   * kinds: hardware, sub-interfaces (lan.110), loop, BVI,
+	   * tap, etc. The hw_interface_by_name hash only catches
+	   * hardware interfaces and misses sub-ifs. */
 	  vnet_main_t *vnm = psm->vnet_main;
-	  vnet_sw_interface_t *si;
-	  uword *p = hash_get_mem (vnm->interface_main.hw_interface_by_name,
-				   iface_name);
-	  if (!p)
+	  unformat_input_t in;
+	  unformat_init_string (&in, iface_name, strlen (iface_name));
+	  if (!unformat (&in, "%U", unformat_vnet_sw_interface, vnm,
+			 &sw_if_index))
 	    {
-	      respond (c, "error reason=unknown_interface name=%s", iface_name);
+	      unformat_free (&in);
+	      respond (c, "error reason=unknown_interface name=%s",
+		       iface_name);
+	      free (iface_name); free (dir_str); free (snap_str);
+	      free (max_str); free (filter_expr);
 	      return 0;
 	    }
-	  vnet_hw_interface_t *hi =
-	      vnet_get_hw_interface (vnm, p[0]);
-	  si = vnet_get_sw_interface (vnm, hi->sw_if_index);
-	  sw_if_index = si->sw_if_index;
+	  unformat_free (&in);
 	}
 
       u8 direction = parse_direction (dir_str);
@@ -453,6 +484,8 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
       pcap_stream_session_t *s = pcap_stream_session_create (
 	  filter_expr ? filter_expr : "", sw_if_index, direction, snaplen,
 	  max_packets, &err);
+      free (iface_name); free (dir_str); free (snap_str); free (max_str);
+      free (filter_expr);
       if (!s)
 	{
 	  respond (c, "error reason=%s", err ? err : "create_failed");
@@ -463,15 +496,28 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 
       respond (c, "ok id=%u", s->session_id);
 
-      /* Take ownership of the fd, send pcap file header, register
-       * for write-error tracking. */
-      s->data_fd = c->fd;
+      /* Dup the fd so the data session has its own. The control
+       * client's clib_file_del (in the streaming-mode handoff
+       * below) will close c->fd; we don't want that to also close
+       * what the data session is reading from. With dup, both
+       * clib_file_del calls (control client, then session
+       * destroy) close their own fd cleanly with no race against
+       * fd reuse. */
+      int dup_fd = dup (c->fd);
+      if (dup_fd < 0)
+	{
+	  respond (c, "error reason=dup_failed");
+	  pcap_stream_session_destroy (s);
+	  return 0;
+	}
+      s->data_fd = dup_fd;
       clib_file_t t = { 0 };
+      t.read_function = data_socket_eof;
       t.error_function = data_socket_error;
-      t.file_descriptor = c->fd;
+      t.file_descriptor = dup_fd;
       t.private_data = s->session_id;
       t.description = format (0, "pcap-stream data session=%u", s->session_id);
-      s->data_file = clib_file_add (&file_main, &t);
+      s->data_file_index = clib_file_add (&file_main, &t);
       send_pcap_file_header (s);
       return 1; /* streaming */
     }
@@ -499,21 +545,27 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 
   if (!strcmp (verb, "delete"))
     {
-      const char *id_str = arg_get (rest, "id");
+      char *id_str = arg_get (rest, "id");
       if (!id_str)
 	{
 	  respond (c, "error reason=missing_id");
 	  return 0;
 	}
-      pcap_stream_session_t *s = session_lookup (strtoul (id_str, 0, 10));
+      u32 id = strtoul (id_str, 0, 10);
+      free (id_str);
+      pcap_stream_session_t *s = session_lookup (id);
       if (!s)
 	{
 	  respond (c, "error reason=no_such_session");
 	  return 0;
 	}
       u64 cap = s->captured, drp = s->dropped;
-      pcap_stream_session_destroy (s);
+      /* Respond BEFORE destroy — destroy may take a moment as it
+       * tears down per-worker rings and the data socket, and we
+       * don't want the response delayed past the client's read
+       * timeout. */
       respond (c, "ok captured=%llu dropped=%llu", cap, drp);
+      pcap_stream_session_destroy (s);
       return 0;
     }
 
@@ -523,7 +575,7 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
        * as if they arrived from the dataplane. Used by task #6's
        * integration test to validate the ring + drain + socket path
        * without standing up the real feature-arc node. */
-      const char *hex = arg_get (rest, "hex");
+      char *hex = arg_get (rest, "hex");
       if (!hex)
 	{
 	  respond (c, "error reason=missing_hex");
@@ -532,12 +584,14 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
       size_t hl = strlen (hex);
       if (hl == 0 || (hl & 1))
 	{
+	  free (hex);
 	  respond (c, "error reason=bad_hex");
 	  return 0;
 	}
       size_t pl = hl / 2;
       if (pl > PCAP_STREAM_MAX_SNAPLEN)
 	{
+	  free (hex);
 	  respond (c, "error reason=too_long");
 	  return 0;
 	}
@@ -565,15 +619,8 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 	    continue;
 	  /* Filter against the ethernet program (DLT_EN10MB) — inject
 	   * always assumes ethernet-framed input. */
-	  if (s->bpf_compiled)
-	    {
-	      struct pcap_pkthdr ph = {
-		.caplen = pl,
-		.len = pl,
-	      };
-	      if (!pcap_offline_filter (&s->bpf_eth, &ph, payload))
-		continue;
-	    }
+	  if (!pcap_filter_run (s->bpf_eth, payload, pl, pl))
+	    continue;
 	  pcap_stream_ring_t *r = s->rings[0]; /* main thread */
 	  pcap_stream_record_t *rec = pcap_stream_ring_reserve (r);
 	  if (!rec)
@@ -591,6 +638,7 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 	  injected++;
 	}
       clib_mem_free (payload);
+      free (hex);
       pcap_stream_drain_wake ();
       respond (c, "ok injected=%u", injected);
       return 0;
@@ -598,13 +646,15 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 
   if (!strcmp (verb, "stats"))
     {
-      const char *id_str = arg_get (rest, "id");
+      char *id_str = arg_get (rest, "id");
       if (!id_str)
 	{
 	  respond (c, "error reason=missing_id");
 	  return 0;
 	}
-      pcap_stream_session_t *s = session_lookup (strtoul (id_str, 0, 10));
+      u32 id = strtoul (id_str, 0, 10);
+      free (id_str);
+      pcap_stream_session_t *s = session_lookup (id);
       if (!s)
 	{
 	  respond (c, "error reason=no_such_session");
@@ -638,15 +688,55 @@ send_pcap_file_header (pcap_stream_session_t *s)
   s->pcap_header_sent = 1;
 }
 
-/* On data-socket EOF/error: tear the session down. */
+/* On data-socket EOF/error: tear the session down.
+ *
+ * We register both read_function and error_function on the data
+ * socket. The read_function is needed because VPP's epoll wiring
+ * only watches an fd for EPOLLIN events when read_function is set
+ * — without it, a client disconnect never triggers our cleanup
+ * and the orphaned fd hangs around until the kernel reuses its
+ * number for a new accept(), which then races against
+ * session_destroy's clib_file_del. Detecting the EOF eagerly
+ * avoids that.
+ *
+ * The CLI never actually sends bytes on the data socket — it's
+ * one-way pcap from server to client — so the only thing read()
+ * ever returns here is 0 (EOF) or -1 (broken pipe). Both mean
+ * "tear down". */
+static clib_error_t *
+data_socket_eof (clib_file_t *uf)
+{
+  /* Drain any pending bytes from the socket. The CLI doesn't send
+   * data, so the only thing we ever see is EOF (read returns 0)
+   * or EAGAIN. EAGAIN means epoll fired spuriously (or there were
+   * a few stray bytes from a busted client); just return and let
+   * the next event re-trigger us. */
+  u32 sid = uf->private_data;
+  u8 buf[256];
+  ssize_t n = read (uf->file_descriptor, buf, sizeof (buf));
+  if (n > 0)
+    {
+      /* Unexpected — protocol says client doesn't write. Discard
+       * and continue. */
+      clib_warning (
+	  "pcap_stream: %zd unexpected bytes from data-socket consumer for "
+	  "session %u (discarded)",
+	  n, sid);
+      return 0;
+    }
+  if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+    {
+      pcap_stream_session_t *s = session_lookup (sid);
+      if (s)
+	pcap_stream_session_destroy (s);
+    }
+  return 0;
+}
+
 static clib_error_t *
 data_socket_error (clib_file_t *uf)
 {
-  u32 sid = uf->private_data;
-  pcap_stream_session_t *s = session_lookup (sid);
-  if (s)
-    pcap_stream_session_destroy (s);
-  return 0;
+  return data_socket_eof (uf);
 }
 
 /* --- per-tick drain: ring -> data fd --- */

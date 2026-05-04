@@ -27,8 +27,6 @@
 #include <vnet/devices/devices.h>
 #include <pcap_stream/pcap_stream.h>
 
-#include <pcap/pcap.h>
-
 typedef struct
 {
   u32 sw_if_index;
@@ -101,8 +99,6 @@ pcap_stream_match_and_enqueue (vlib_main_t *vm, vlib_buffer_t *b,
    * snaplen-limited capture; full reassembly would mean walking
    * the chain which we skip in v1. */
   u32 first_seg_len = b->current_length;
-
-  struct pcap_pkthdr ph = { .caplen = first_seg_len, .len = orig_len };
   const u8 *eth = vlib_buffer_get_current (b);
 
   for (u32 i = 0; i < PCAP_STREAM_MAX_SESSIONS; i++)
@@ -120,9 +116,8 @@ pcap_stream_match_and_enqueue (vlib_main_t *vm, vlib_buffer_t *b,
       if (s->sw_if_index != ~0 && s->sw_if_index != iface)
 	continue;
 
-      /* libpcap filter — empty filter compiles to "always match". */
-      if (s->bpf_compiled &&
-	  !pcap_offline_filter (&s->bpf_eth, &ph, eth))
+      /* libpcap filter — NULL filter (no expression) always matches. */
+      if (!pcap_filter_run (s->bpf_eth, eth, first_seg_len, orig_len))
 	continue;
 
       pcap_stream_ring_t *r = s->rings[thread_index];
@@ -260,6 +255,25 @@ pcap_stream_node_enable_iface (u32 sw_if_index, u8 direction, int enable)
   if (direction & PCAP_STREAM_DIR_TX)
     vnet_feature_enable_disable ("interface-output", "pcap-stream-tx",
 				 sw_if_index, enable, 0, 0);
+}
+
+/* Enable/disable the feature arcs on every currently-known sw
+ * interface. Used for "any" mode where the operator hasn't named
+ * a specific interface. New interfaces created after enable
+ * won't pick this up automatically — registering an interface-
+ * add callback is a v2 nice-to-have. */
+void
+pcap_stream_node_enable_all (u8 direction, int enable)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_sw_interface_t *si;
+  pool_foreach (si, vnm->interface_main.sw_interfaces)
+    {
+      if (si->type != VNET_SW_INTERFACE_TYPE_HARDWARE &&
+	  si->type != VNET_SW_INTERFACE_TYPE_SUB)
+	continue;
+      pcap_stream_node_enable_iface (si->sw_if_index, direction, enable);
+    }
 }
 
 #endif /* CLIB_MARCH_VARIANT */

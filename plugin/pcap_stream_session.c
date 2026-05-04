@@ -10,47 +10,36 @@
  */
 
 #include <pcap_stream/pcap_stream.h>
+#include <vlib/file.h>
+#include <unistd.h>
 
 /* Compile both DLT_EN10MB and DLT_RAW programs so we can dispatch
  * on the buffer's effective offset at filter time — same trick
- * `bpf_trace_filter` uses upstream. Returns 0 on success, -1 on
- * compile failure (with *err_msg set). */
+ * `bpf_trace_filter` uses upstream. The eth side is required (the
+ * RX/TX feature-arc nodes always have ethernet-framed buffers);
+ * the raw side is optional because expressions like `arp` and
+ * `ether host ..` are eth-only and libpcap rejects them with
+ * "expression rejects all packets" when compiled against DLT_RAW
+ * — which would mean the drop tap (DLT_RAW) just never matches,
+ * which is the correct behaviour anyway.
+ *
+ * Returns 0 on success, -1 on eth-side compile failure (with
+ * *err_msg set). Raw-side failure leaves bpf_raw NULL and
+ * silently disables drop-mode matching for this session. */
 static int
 compile_filter (pcap_stream_session_t *s, const char *expr, char **err_msg)
 {
-  pcap_t *eth_dummy = pcap_open_dead (DLT_EN10MB, PCAP_STREAM_MAX_SNAPLEN);
-  pcap_t *raw_dummy = pcap_open_dead (DLT_RAW, PCAP_STREAM_MAX_SNAPLEN);
-  if (!eth_dummy || !raw_dummy)
-    {
-      if (eth_dummy)
-	pcap_close (eth_dummy);
-      if (raw_dummy)
-	pcap_close (raw_dummy);
-      *err_msg = strdup ("pcap_open_dead failed");
-      return -1;
-    }
-
-  if (pcap_compile (eth_dummy, &s->bpf_eth, expr, 1, PCAP_NETMASK_UNKNOWN) <
-      0)
-    {
-      *err_msg = strdup (pcap_geterr (eth_dummy));
-      pcap_close (eth_dummy);
-      pcap_close (raw_dummy);
-      return -1;
-    }
-  if (pcap_compile (raw_dummy, &s->bpf_raw, expr, 1, PCAP_NETMASK_UNKNOWN) <
-      0)
-    {
-      *err_msg = strdup (pcap_geterr (raw_dummy));
-      pcap_freecode (&s->bpf_eth);
-      pcap_close (eth_dummy);
-      pcap_close (raw_dummy);
-      return -1;
-    }
-
-  pcap_close (eth_dummy);
-  pcap_close (raw_dummy);
-  s->bpf_compiled = 1;
+  s->bpf_eth = pcap_filter_compile (expr, PCAP_FILTER_DLT_EN10MB,
+				    PCAP_STREAM_MAX_SNAPLEN, err_msg);
+  if (!s->bpf_eth)
+    return -1;
+  /* Best-effort raw-side compile. Discard any error — it's expected
+   * for ethernet-only filters. */
+  char *raw_err = NULL;
+  s->bpf_raw = pcap_filter_compile (expr, PCAP_FILTER_DLT_RAW,
+				    PCAP_STREAM_MAX_SNAPLEN, &raw_err);
+  if (raw_err)
+    free (raw_err);
   return 0;
 }
 
@@ -65,13 +54,26 @@ adjust_refcounts (pcap_stream_session_t *s, int delta)
 
   if (idx == ~0)
     {
-      /* "any" interface — bump the global rx/tx counters and let
-       * the node layer handle "enable on every interface" semantics
-       * lazily as packets arrive. */
+      /* "any" interface — bump global counter; on the first
+       * "any" session for each direction, enable the feature
+       * arc on every existing interface. New interfaces created
+       * after this won't auto-pick up; v2 nice-to-have. */
       if (s->direction & PCAP_STREAM_DIR_RX)
-	psm->any_iface_rx_refcnt += delta;
+	{
+	  psm->any_iface_rx_refcnt += delta;
+	  if (delta > 0 && psm->any_iface_rx_refcnt == 1)
+	    pcap_stream_node_enable_all (PCAP_STREAM_DIR_RX, 1);
+	  else if (delta < 0 && psm->any_iface_rx_refcnt == 0)
+	    pcap_stream_node_enable_all (PCAP_STREAM_DIR_RX, 0);
+	}
       if (s->direction & PCAP_STREAM_DIR_TX)
-	psm->any_iface_tx_refcnt += delta;
+	{
+	  psm->any_iface_tx_refcnt += delta;
+	  if (delta > 0 && psm->any_iface_tx_refcnt == 1)
+	    pcap_stream_node_enable_all (PCAP_STREAM_DIR_TX, 1);
+	  else if (delta < 0 && psm->any_iface_tx_refcnt == 0)
+	    pcap_stream_node_enable_all (PCAP_STREAM_DIR_TX, 0);
+	}
     }
   else
     {
@@ -139,6 +141,7 @@ pcap_stream_session_create (const char *filter_expr, u32 sw_if_index,
   s->snaplen = snaplen;
   s->max_packets = max_packets;
   s->data_fd = -1;
+  s->data_file_index = ~0;
   s->created_at = vlib_time_now (psm->vlib_main);
   s->filter_expr = strdup (filter_expr ? filter_expr : "");
 
@@ -170,22 +173,35 @@ pcap_stream_session_destroy (pcap_stream_session_t *s)
 
   adjust_refcounts (s, -1);
 
-  if (s->data_file)
+  /* clib_file_del closes the underlying fd (dont_close=0 default),
+   * so when a file_index is registered we must NOT close
+   * data_fd ourselves — that would double-close, and if the
+   * kernel has reused the fd for a new client connection in
+   * between, we'd close the new client's fd by accident. Only
+   * close data_fd directly when no file is registered (the
+   * unhandover-fast-path case that doesn't currently exist but
+   * is here for symmetry). */
+  if (s->data_file_index != ~0u)
     {
-      clib_file_del (&file_main, s->data_file);
-      s->data_file = 0;
+      clib_file_del_by_index (&file_main, s->data_file_index);
+      s->data_file_index = ~0;
+      s->data_fd = -1;
     }
-  if (s->data_fd >= 0)
+  else if (s->data_fd >= 0)
     {
       close (s->data_fd);
       s->data_fd = -1;
     }
 
-  if (s->bpf_compiled)
+  if (s->bpf_eth)
     {
-      pcap_freecode (&s->bpf_eth);
-      pcap_freecode (&s->bpf_raw);
-      s->bpf_compiled = 0;
+      pcap_filter_free (s->bpf_eth);
+      s->bpf_eth = NULL;
+    }
+  if (s->bpf_raw)
+    {
+      pcap_filter_free (s->bpf_raw);
+      s->bpf_raw = NULL;
     }
 
   for (u32 i = 0; i < vec_len (s->rings); i++)
