@@ -1,0 +1,108 @@
+From: vpp-pcap-plugin <noreply@anthropic.com>
+Subject: [PATCH] vlib: add per-buffer drop-callback hook
+
+Adds vlib_drop_callback_register() / _unregister() so plugins can
+observe packets right before they're freed by the error-drop node.
+The callback receives (vm, b, error_index) — the encoded
+(node << 16 | code) is enough for the plugin to format a human-
+readable drop reason via the existing counter-name machinery.
+
+Used by the pcap_stream plugin to capture dropped packets in `-d
+drop` mode, attaching the drop reason as a pcap-ng EPB comment so
+operators see the reason inline in tcpdump/Wireshark output.
+
+Generally useful — anyone wanting to observe drops (sFlow drop
+monitoring, IPFIX export, debugging tools) can register without
+having to wrap or replace error-drop. Cheap when no callbacks are
+registered (single PREDICT_FALSE'd vec_len check).
+---
+--- a/src/vlib/drop.c
++++ b/src/vlib/drop.c
+@@ -18,6 +18,37 @@
+ #include <vlib/vlib.h>
+ #include <vppinfra/vector/count_equal.h>
+ 
++/* --- Drop callback hook ---
++ *
++ * Plugins (e.g. pcap_stream) can register a callback that fires for
++ * every buffer hitting the error-drop node, BEFORE the buffer is
++ * freed. Used for observability — the callback must not modify the
++ * buffer. Cheap when no callbacks are registered (vec_len check is
++ * branch-predicted away in process_drop_punt).
++ */
++static vlib_drop_callback_fn_t *vlib_drop_callbacks;
++
++void
++vlib_drop_callback_register (vlib_drop_callback_fn_t fn)
++{
++  vlib_drop_callback_fn_t *cb;
++  vec_foreach (cb, vlib_drop_callbacks)
++    if (*cb == fn)
++      return;
++  vec_add1 (vlib_drop_callbacks, fn);
++}
++
++void
++vlib_drop_callback_unregister (vlib_drop_callback_fn_t fn)
++{
++  for (uword i = 0; i < vec_len (vlib_drop_callbacks); i++)
++    if (vlib_drop_callbacks[i] == fn)
++      {
++	vec_del1 (vlib_drop_callbacks, i);
++	return;
++      }
++}
++
+ typedef enum
+ {
+   ERROR_DISPOSITION_DROP,
+@@ -234,6 +265,22 @@
+ 
+   if (disposition == ERROR_DISPOSITION_DROP || !vm->os_punt_frame)
+     {
++      /* Invoke registered drop callbacks BEFORE freeing buffers.
++       * Callbacks see (vm, b, error_index); error_index is encoded
++       * (node << 16 | code), decode via vlib_error_get_node/code or
++       * pass to vm->error_main.counters_heap[].desc for a string
++       * reason. PREDICT_FALSE so no-callback case is branch-free. */
++      if (PREDICT_FALSE (vec_len (vlib_drop_callbacks) > 0 &&
++			 disposition == ERROR_DISPOSITION_DROP))
++	{
++	  vlib_drop_callback_fn_t *cb;
++	  for (uword i = 0; i < frame->n_vectors; i++)
++	    {
++	      vec_foreach (cb, vlib_drop_callbacks)
++		(*cb) (vm, bufs[i], errors[i]);
++	    }
++	}
++
+       vlib_buffer_free (vm, from, frame->n_vectors);
+ 
+       /* If there is no punt function, free the frame as well. */
+--- a/src/vlib/main.h
++++ b/src/vlib/main.h
+@@ -498,6 +498,24 @@
+ vlib_main_t *vlib_get_main_not_inline (void);
+ elog_main_t *vlib_get_elog_main_not_inline ();
+ 
++/* --- Drop callback hook (see drop.c) ---
++ *
++ * Plugins can register a callback to observe packets immediately
++ * before error-drop frees them. The buffer MUST NOT be modified.
++ * `error_index` is the encoded error (node << 16 | code); decode
++ * with vlib_error_get_node()/get_code(). Format the human-readable
++ * reason via vm->error_main.counters_heap[].desc after computing
++ * the counter index from the error code.
++ *
++ * vlib_buffer_t is already in scope here because vlib.h includes
++ * vlib/buffer.h before vlib/main.h.
++ */
++typedef void (*vlib_drop_callback_fn_t) (struct vlib_main_t *vm,
++					 vlib_buffer_t *b,
++					 u32 error_index);
++void vlib_drop_callback_register (vlib_drop_callback_fn_t fn);
++void vlib_drop_callback_unregister (vlib_drop_callback_fn_t fn);
++
+ #endif /* included_vlib_main_h */
+ 
+ /*

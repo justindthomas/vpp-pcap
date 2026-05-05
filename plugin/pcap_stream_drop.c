@@ -4,47 +4,84 @@
 
 /* pcap_stream_drop.c — error-drop capture path.
  *
- * Hooks the vlib drop callback exposed by our small VPP patch
- * (see vpp-patches/0001-error-drop-callback-hook.patch). The
- * callback fires inside error-drop on every dropped buffer; we
- * filter against PCAP_STREAM_DIR_DROP sessions and enqueue.
+ * Hooks the vlib drop callback added by our patch in
+ * vpp-patches/0001-error-drop-callback-hook.patch. Per-buffer
+ * callback fires inside error-drop just before vlib_buffer_free;
+ * we filter against PCAP_STREAM_DIR_DROP sessions and enqueue the
+ * matched packets, attaching the drop reason (e.g.
+ * "ip6-input.no-route") as a pcap-ng EPB comment so it surfaces in
+ * the operator's output.
  *
- * If the patch hasn't been applied, the symbol resolves at link
- * time to the weak no-op stub at the bottom of this file and drop
- * capture silently degrades to a no-op (rest of the plugin still
- * works). Same shape as how sfw handles its optional vpp-patch
- * extensions.
+ * Weak fallbacks are kept so the plugin can still load against
+ * unpatched VPP (drop-mode just no-ops); the operator sees "drop"
+ * sessions create successfully but capture nothing.
  */
 
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
 #include <pcap_stream/pcap_stream.h>
 
-#ifdef HAVE_VLIB_DROP_CALLBACK
 extern void vlib_drop_callback_register (
-    void (*fn) (vlib_main_t *, vlib_buffer_t *, u64));
+    void (*fn) (vlib_main_t *, vlib_buffer_t *, u32));
 extern void vlib_drop_callback_unregister (
-    void (*fn) (vlib_main_t *, vlib_buffer_t *, u64));
-#else
-/* Weak no-op fallbacks so the build works against an unpatched VPP.
- * The drop tap is silently a no-op in that case — sessions with
- * direction=drop will appear active but never receive packets. */
+    void (*fn) (vlib_main_t *, vlib_buffer_t *, u32));
+
+/* Weak no-op fallbacks. Used if the patch isn't applied — the link
+ * succeeds, drop-mode runs but never receives buffers. */
 __attribute__ ((weak)) void
-vlib_drop_callback_register (void (*fn) (vlib_main_t *, vlib_buffer_t *, u64))
+vlib_drop_callback_register (void (*fn) (vlib_main_t *, vlib_buffer_t *, u32))
 {
   (void) fn;
 }
 
 __attribute__ ((weak)) void
 vlib_drop_callback_unregister (
-    void (*fn) (vlib_main_t *, vlib_buffer_t *, u64))
+    void (*fn) (vlib_main_t *, vlib_buffer_t *, u32))
 {
   (void) fn;
 }
-#endif
+
+/* Format a human-readable drop reason from the encoded error.
+ * Returns a freshly malloc'd string the caller frees. Format:
+ * "<node-name>.<counter-name>" e.g. "ip6-input.no-route", which is
+ * the same text vlib uses for `show errors`. Returns NULL if the
+ * error can't be decoded (caller should skip the comment). */
+static char *
+format_drop_reason (vlib_main_t *vm, u32 error_index)
+{
+  vlib_error_main_t *em = &vm->error_main;
+  uword node_index = vlib_error_get_node (&vm->node_main, error_index);
+  uword code = vlib_error_get_code (&vm->node_main, error_index);
+
+  if (node_index >= vec_len (vm->node_main.nodes))
+    return NULL;
+  vlib_node_t *n = vlib_get_node (vm, node_index);
+  if (code >= n->n_errors)
+    return NULL;
+
+  uword counter_idx = n->error_heap_index + code;
+  if (counter_idx >= vec_len (em->counters_heap))
+    return NULL;
+
+  /* counters_heap[i].desc is a vlib-format vec (NUL-terminated by
+   * the format machinery). n->name is also a u8 vec. Build "<node>.
+   * <code>" with snprintf into a sane buffer. */
+  const char *node_name = (const char *) n->name;
+  const char *code_desc = em->counters_heap[counter_idx].desc;
+  if (!node_name || !code_desc)
+    return NULL;
+
+  char *out = NULL;
+  size_t want = strlen (node_name) + 1 + strlen (code_desc) + 1;
+  out = malloc (want);
+  if (!out)
+    return NULL;
+  snprintf (out, want, "%s.%s", node_name, code_desc);
+  return out;
+}
 
 static void
-pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
+pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
 {
   pcap_stream_main_t *psm = &pcap_stream_main;
   u32 thread_index = vm->thread_index;
@@ -52,11 +89,12 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
   u32 first_seg_len = b->current_length;
   u32 sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
 
-  /* error-drop runs after the packet has progressed through some
-   * fraction of the L3/L4 pipeline, so b->current_data may not
-   * point at the ethernet header anymore. Use DLT_RAW for the
-   * filter — most drop reasons are L3+ anyway. */
+  /* Format reason once per drop, regardless of how many sessions
+   * match. The DLT_RAW filter test below uses the raw payload
+   * bytes (b->current_data may have advanced past L2 by the time
+   * error-drop runs). */
   const u8 *pkt = vlib_buffer_get_current (b);
+  char *reason = format_drop_reason (vm, error_index);
 
   struct timespec ts;
   clock_gettime (CLOCK_REALTIME, &ts);
@@ -69,9 +107,6 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
 	continue;
       if (!(s->direction & PCAP_STREAM_DIR_DROP))
 	continue;
-      /* Drop-mode sessions can't filter by sw_if_index reliably
-       * (some drop sources don't carry it). If the operator
-       * specified an interface, only match when it's set. */
       if (s->sw_if_index != ~0 && s->sw_if_index != sw_if_index)
 	continue;
 
@@ -90,11 +125,29 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u64 e0)
       rec->orig_len = orig_len;
       rec->len = first_seg_len < s->snaplen ? first_seg_len : s->snaplen;
       rec->direction = PCAP_STREAM_DIR_DROP;
+      /* Stash drop reason in the record's reserved area so the
+       * drain can emit it as a pcap-ng EPB comment. We bound the
+       * length to keep records uniform — most drop reasons are
+       * <60 chars (longest is around "ip6-input.frag-internet-header-overflow"
+       * at ~40). Truncated reasons still attach a useful prefix. */
+      if (reason)
+	{
+	  size_t rl = strlen (reason);
+	  if (rl >= sizeof (rec->reason))
+	    rl = sizeof (rec->reason) - 1;
+	  memcpy (rec->reason, reason, rl);
+	  rec->reason[rl] = 0;
+	}
+      else
+	{
+	  rec->reason[0] = 0;
+	}
       clib_memcpy_fast (pcap_stream_record_data (rec), pkt, rec->len);
       pcap_stream_ring_commit (r);
     }
-  (void) e0; /* error code is logged by error-drop itself; we don't
-		surface it through the pcap stream for v1. */
+
+  if (reason)
+    free (reason);
 }
 
 void

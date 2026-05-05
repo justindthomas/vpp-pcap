@@ -78,7 +78,13 @@ typedef enum
  * snaplen — see pcap_stream_record_data() to walk to it. `len` may
  * be < snaplen if the original packet was shorter; `orig_len` is
  * the on-the-wire length so the consumer can render the truncation
- * indicator. */
+ * indicator.
+ *
+ * `reason[]` is non-empty only for drop-mode captures — carries the
+ * encoded drop reason (e.g. "ip6-input.no-route") which the drain
+ * attaches to the EPB as a pcap-ng comment option. 64 bytes covers
+ * every drop reason vlib emits today. Empty string for rx/tx
+ * captures. */
 typedef struct
 {
   u64 ts_ns;	      /* CLOCK_REALTIME in ns */
@@ -87,6 +93,7 @@ typedef struct
   u32 len;	      /* bytes actually copied */
   u8 direction;	      /* pcap_stream_direction_t single bit */
   u8 _pad[3];
+  char reason[64];    /* drop reason for DIR_DROP; empty otherwise */
   /* u8 payload[snaplen] follows immediately — access via
    * pcap_stream_record_data(). */
 } pcap_stream_record_hdr_t;
@@ -328,6 +335,7 @@ void pcap_stream_drop_enable (int enable);
 #define PCAPNG_VERSION_MINOR 0
 
 /* Option codes */
+#define PCAPNG_OPT_COMMENT 1 /* free-form comment string */
 #define PCAPNG_OPT_ENDOFOPT 0
 #define PCAPNG_IDB_OPT_NAME 2 /* if_name string */
 #define PCAPNG_IDB_OPT_TSRESOL 9 /* timestamp resolution */
@@ -346,9 +354,13 @@ int pcap_stream_pcapng_emit_prelude (pcap_stream_session_t *s,
 /* Emit one EPB. Header + packet bytes + options + trailer go out
  * atomically via sendmsg. iface_id is looked up from
  * s->sw_to_iface_id; if not present, the EPB is skipped (caller
- * decides to drop or fall back). */
+ * decides to drop or fall back). `comment` is optional; when
+ * non-NULL and non-empty, attached as an opt_comment EPB option
+ * and surfaces in tcpdump/Wireshark output (used to carry the drop
+ * reason for `-d drop` mode captures). */
 int pcap_stream_pcapng_emit_epb (pcap_stream_session_t *s, u32 sw_if_index,
 				 u8 direction, u64 ts_ns, u32 caplen,
-				 u32 orig_len, const u8 *pkt);
+				 u32 orig_len, const u8 *pkt,
+				 const char *comment);
 
 #endif /* __included_pcap_stream_h__ */

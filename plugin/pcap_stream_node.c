@@ -132,6 +132,7 @@ pcap_stream_match_and_enqueue (vlib_main_t *vm, vlib_buffer_t *b,
       rec->orig_len = orig_len;
       rec->len = first_seg_len < s->snaplen ? first_seg_len : s->snaplen;
       rec->direction = direction;
+      rec->reason[0] = 0; /* rx/tx — only drop-mode sets this */
       clib_memcpy_fast (pcap_stream_record_data (rec), eth, rec->len);
       pcap_stream_ring_commit (r);
       matched++;

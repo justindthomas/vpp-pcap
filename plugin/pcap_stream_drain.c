@@ -651,6 +651,7 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 	  rec->orig_len = pl;
 	  rec->len = pl < s->snaplen ? pl : s->snaplen;
 	  rec->direction = PCAP_STREAM_DIR_RX;
+	  rec->reason[0] = 0;
 	  clib_memcpy_fast (pcap_stream_record_data (rec), payload, rec->len);
 	  pcap_stream_ring_commit (r);
 	  injected++;
@@ -774,12 +775,16 @@ drain_one_session (pcap_stream_session_t *s)
 	    break;
 
 	  /* Emit one pcap-ng EPB tagged with the interface ID for
-	   * rec->sw_if_index. The pcap-ng emitter handles atomic
-	   * sendmsg + drop-on-no-IDB internally. EPIPE / short
-	   * write tears down the session. */
+	   * rec->sw_if_index. rec->reason carries the drop reason
+	   * for DIR_DROP captures (empty for rx/tx); the emitter
+	   * attaches it as a pcap-ng opt_comment so the operator
+	   * sees "[Comment: ip6-input.no-route]" in tcpdump or
+	   * Wireshark output. EPIPE / short write tears down. */
+	  const char *comment = rec->reason[0] ? rec->reason : NULL;
 	  if (pcap_stream_pcapng_emit_epb (s, rec->sw_if_index, rec->direction,
 					   rec->ts_ns, rec->len, rec->orig_len,
-					   pcap_stream_record_data (rec)) < 0)
+					   pcap_stream_record_data (rec),
+					   comment) < 0)
 	    {
 	      pcap_stream_session_destroy (s);
 	      return;

@@ -192,7 +192,7 @@ pcap_stream_pcapng_emit_prelude (pcap_stream_session_t *s, vnet_main_t *vnm)
 int
 pcap_stream_pcapng_emit_epb (pcap_stream_session_t *s, u32 sw_if_index,
 			     u8 direction, u64 ts_ns, u32 caplen,
-			     u32 orig_len, const u8 *pkt)
+			     u32 orig_len, const u8 *pkt, const char *comment)
 {
   /* Look up iface_id. Drop quietly if we don't have an IDB for this
    * sw_if_index (e.g. a loopback or interface added after session
@@ -203,18 +203,24 @@ pcap_stream_pcapng_emit_epb (pcap_stream_session_t *s, u32 sw_if_index,
   if (iface_id == ~0u)
     return 0;
 
+  /* Optional opt_comment for drop-reason etc. */
+  size_t comment_len = (comment && comment[0]) ? strlen (comment) : 0;
+  size_t comment_padded = PCAPNG_PAD4 (comment_len);
+  u32 comment_block = comment_len ? (u32) (4 + comment_padded) : 0;
+
   /* EPB layout:
    *   header:        block_type(4) + total_len(4) = 8
    *   fixed body:    iface_id(4) + ts_high(4) + ts_low(4)
    *                  + cap_len(4) + orig_len(4) = 20
    *   pkt data:      caplen bytes, padded to 4
+   *   comment opt:   code(2)+len(2) + N + pad (if comment present)
    *   flags opt:     code(2)+len(2) + flags(4) = 8
    *   end opt:       code(2)+len(2) = 4
    *   trailer:       total_len(4) = 4
    */
   u32 cap_padded = PCAPNG_PAD4 (caplen);
   u32 pkt_pad = cap_padded - caplen;
-  u32 total_len = 8 + 20 + cap_padded + 8 + 4 + 4;
+  u32 total_len = 8 + 20 + cap_padded + comment_block + 8 + 4 + 4;
 
   u8 prefix[28];
   u32 *p = (u32 *) prefix;
@@ -227,11 +233,28 @@ pcap_stream_pcapng_emit_epb (pcap_stream_session_t *s, u32 sw_if_index,
   *p++ = orig_len;
 
   /* Trailer: padding + flags option + end-of-opt + block_total_length. */
-  u8 trailer[20];
+  /* Trailer holds: pkt-padding + optional comment opt + flags opt
+   * + end-of-opt + total_len. Worst-case sizing: 3 (max pkt pad) +
+   * 4 + 64 (comment header + truncated comment) + 8 + 4 + 4 = 87.
+   * 256 leaves headroom. */
+  u8 trailer[256];
   size_t toff = 0;
-  /* zero-pad packet data to 4-byte boundary */
   for (u32 i = 0; i < pkt_pad; i++)
     trailer[toff++] = 0;
+
+  /* opt_comment, if present */
+  if (comment_len)
+    {
+      ((u16 *) (trailer + toff))[0] = PCAPNG_OPT_COMMENT;
+      ((u16 *) (trailer + toff))[1] = (u16) comment_len;
+      toff += 4;
+      memcpy (trailer + toff, comment, comment_len);
+      if (comment_padded > comment_len)
+	memset (trailer + toff + comment_len, 0,
+		comment_padded - comment_len);
+      toff += comment_padded;
+    }
+
   /* flags option */
   ((u16 *) (trailer + toff))[0] = PCAPNG_EPB_OPT_FLAGS;
   ((u16 *) (trailer + toff))[1] = 4;

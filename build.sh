@@ -61,9 +61,13 @@ echo "[+] Running build inside container..."
         git clone --depth 1 --branch "$VPP_BRANCH" \
             https://github.com/FDio/vpp.git /tmp/vpp-src 2>&1 | tail -3
 
-        # VPP patches required for the `-d drop` capture mode (the
-        # error-drop callback hook). Plugin builds without them but
-        # the drop tap will be a no-op.
+        # VPP patches required for "-d drop" capture mode. The
+        # plugin pcap_stream_drop.c declares the drop-callback
+        # symbols extern; this patch exposes them in libvlib.so.
+        # Without the patch (i.e. against vanilla VPP), the symbols
+        # resolve to the weak no-op stubs and drop-mode silently
+        # degrades; you still need this patch on the plugin build
+        # itself to get the matching header declarations.
         if [ -d /src/vpp-patches ] && compgen -G "/src/vpp-patches/*.patch" > /dev/null; then
             echo "[+] Applying VPP patches..."
             for p in /src/vpp-patches/*.patch; do
