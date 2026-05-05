@@ -15,10 +15,15 @@ Generally useful — anyone wanting to observe drops (sFlow drop
 monitoring, IPFIX export, debugging tools) can register without
 having to wrap or replace error-drop. Cheap when no callbacks are
 registered (single PREDICT_FALSE'd vec_len check).
+
+drop.c is a MULTIARCH source (compiled per CPU variant), so the
+new register/unregister symbols are gated by CLIB_MARCH_VARIANT to
+emit once in the generic build only — variants extern-resolve the
+registry vec at link time.
 ---
 --- a/src/vlib/drop.c
 +++ b/src/vlib/drop.c
-@@ -18,6 +18,37 @@
+@@ -18,6 +18,54 @@
  #include <vlib/vlib.h>
  #include <vppinfra/vector/count_equal.h>
  
@@ -29,8 +34,19 @@ registered (single PREDICT_FALSE'd vec_len check).
 + * freed. Used for observability — the callback must not modify the
 + * buffer. Cheap when no callbacks are registered (vec_len check is
 + * branch-predicted away in process_drop_punt).
++ *
++ * drop.c is a MULTIARCH source — VPP compiles it once per CPU
++ * variant (generic, hsw, skx, icl). Gate the registry vec and
++ * register/unregister functions with CLIB_MARCH_VARIANT so they
++ * only emit symbols once (in the generic build), not 4× —
++ * otherwise the linker fails with multiple definition when
++ * collapsing the variant objects into libvlib.so.
 + */
-+static vlib_drop_callback_fn_t *vlib_drop_callbacks;
++#ifndef CLIB_MARCH_VARIANT
++/* Non-static so the multi-arch variants of process_drop_punt
++ * (compiled into vlib_hsw / vlib_skx / vlib_icl object dirs) can
++ * extern-resolve to this single definition at link time. */
++vlib_drop_callback_fn_t *vlib_drop_callbacks;
 +
 +void
 +vlib_drop_callback_register (vlib_drop_callback_fn_t fn)
@@ -52,11 +68,17 @@ registered (single PREDICT_FALSE'd vec_len check).
 +	return;
 +      }
 +}
++#else
++/* Multi-arch variants reach the registry vec via the generic
++ * symbol. extern declaration so process_drop_punt below can read
++ * vec_len(vlib_drop_callbacks) and iterate. */
++extern vlib_drop_callback_fn_t *vlib_drop_callbacks;
++#endif
 +
  typedef enum
  {
    ERROR_DISPOSITION_DROP,
-@@ -234,6 +265,22 @@
+@@ -234,6 +282,22 @@
  
    if (disposition == ERROR_DISPOSITION_DROP || !vm->os_punt_frame)
      {
