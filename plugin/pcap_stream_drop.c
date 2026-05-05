@@ -70,14 +70,38 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
   pcap_stream_main_t *psm = &pcap_stream_main;
   u32 thread_index = vm->thread_index;
   u32 orig_len = vlib_buffer_length_in_chain (vm, b);
-  u32 first_seg_len = b->current_length;
   u32 sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
 
+  /* Rewind to the buffer's start when bytes have been stripped,
+   * so the captured frame includes the original L2 header (and
+   * L3 header if ip4/6-input had advanced past it before the
+   * drop). VPP doesn't overwrite the data ahead of current_data
+   * in normal forwarding paths, so b->data[0..current_data] is
+   * still the on-wire bytes. This gives Wireshark/tshark a
+   * properly-framed Ethernet frame to decode against the DLT_EN10MB
+   * IDB instead of the previous "garbage MAC + bytes-after-L2"
+   * misframing.
+   *
+   * Negative current_data means a header was prepended (TX path,
+   * unusual at error-drop) — in that case b->data is not the
+   * frame start; vlib_buffer_get_current is. */
+  i16 cd = b->current_data;
+  const u8 *pkt;
+  u32 first_seg_len;
+  if (cd > 0)
+    {
+      pkt = b->data;
+      first_seg_len = (u32) cd + b->current_length;
+      orig_len += (u32) cd;
+    }
+  else
+    {
+      pkt = vlib_buffer_get_current (b);
+      first_seg_len = b->current_length;
+    }
+
   /* Format reason once per drop, regardless of how many sessions
-   * match. The DLT_RAW filter test below uses the raw payload
-   * bytes (b->current_data may have advanced past L2 by the time
-   * error-drop runs). */
-  const u8 *pkt = vlib_buffer_get_current (b);
+   * match. */
   char *reason = format_drop_reason (vm, error_index);
 
   struct timespec ts;
@@ -94,7 +118,11 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
       if (s->sw_if_index != ~0 && s->sw_if_index != sw_if_index)
 	continue;
 
-      if (!pcap_filter_run (s->bpf_raw, pkt, first_seg_len, orig_len))
+      /* Filter against bpf_eth — we capture from b->data which
+       * includes the original L2, so the filter sees a normal
+       * Ethernet frame. (Pre-fix this used bpf_raw because
+       * current_data had already skipped L2.) */
+      if (!pcap_filter_run (s->bpf_eth, pkt, first_seg_len, orig_len))
 	continue;
 
       pcap_stream_ring_t *r = s->rings[thread_index];
