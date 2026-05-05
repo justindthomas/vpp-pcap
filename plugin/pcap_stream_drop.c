@@ -72,27 +72,47 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
   u32 orig_len = vlib_buffer_length_in_chain (vm, b);
   u32 sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
 
-  /* Rewind to the buffer's start when bytes have been stripped,
-   * so the captured frame includes the original L2 header (and
-   * L3 header if ip4/6-input had advanced past it before the
-   * drop). VPP doesn't overwrite the data ahead of current_data
-   * in normal forwarding paths, so b->data[0..current_data] is
-   * still the on-wire bytes. This gives Wireshark/tshark a
-   * properly-framed Ethernet frame to decode against the DLT_EN10MB
-   * IDB instead of the previous "garbage MAC + bytes-after-L2"
-   * misframing.
+  /* Rewind to the L2 header so the captured frame is decodable
+   * against the DLT_EN10MB IDB. Three cases:
    *
-   * Negative current_data means a header was prepended (TX path,
-   * unusual at error-drop) — in that case b->data is not the
-   * frame start; vlib_buffer_get_current is. */
-  i16 cd = b->current_data;
+   * 1. L2_HDR_OFFSET flag set — vnet_buffer(b)->l2_hdr_offset is
+   *    the absolute offset from b->data to the start of the L2
+   *    header. This is precise: ethernet-input stamps it and
+   *    every downstream node that advances past L2 leaves it
+   *    alone. Use it when available.
+   *
+   * 2. No flag, current_data > 0 — fall back to assuming a
+   *    14-byte Ethernet header sits immediately before
+   *    current_data. Not perfect (misses VLAN tags and over-
+   *    reads if multiple headers were stripped), but better
+   *    than rewinding by current_data which lands in unused
+   *    headroom for ip4-input drops (cd==34, real L2 is 20
+   *    bytes inside that range).
+   *
+   * 3. current_data <= 0 — header was prepended (TX path,
+   *    unusual at error-drop). vlib_buffer_get_current is the
+   *    frame start. */
   const u8 *pkt;
   u32 first_seg_len;
-  if (cd > 0)
+  if (b->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID)
     {
-      pkt = b->data;
-      first_seg_len = (u32) cd + b->current_length;
-      orig_len += (u32) cd;
+      i16 l2_off = vnet_buffer (b)->l2_hdr_offset;
+      pkt = b->data + l2_off;
+      i32 stripped = (i32) b->current_data - (i32) l2_off;
+      if (stripped < 0)
+	stripped = 0;
+      first_seg_len = (u32) stripped + b->current_length;
+      orig_len += (u32) stripped;
+    }
+  else if (b->current_data > 0)
+    {
+      const u32 ETH_HLEN = 14;
+      u32 rewind = (u32) b->current_data < ETH_HLEN
+		     ? (u32) b->current_data
+		     : ETH_HLEN;
+      pkt = vlib_buffer_get_current (b) - rewind;
+      first_seg_len = rewind + b->current_length;
+      orig_len += rewind;
     }
   else
     {
