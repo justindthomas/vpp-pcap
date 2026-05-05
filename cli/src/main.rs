@@ -265,20 +265,27 @@ fn cmd_capture(sock: &PathBuf, opts: CaptureOpts) -> Result<()> {
                     // -l = line buffered, -t ad = absolute date+time,
                     // -nN = no name resolution (-N defaults to none),
                     // -T fields with explicit column set.
+                    // tshark's column-format mode renders aligned
+                    // columns (like default tshark output) but lets
+                    // us insert an Iface and Dir column. Looks like
+                    // normal packet-capture output instead of raw
+                    // tab-separated fields. The %Cus:<field>:0:R
+                    // form pulls a custom field; :R means
+                    // "resolved" (formatted, not raw bytes).
                     ("tshark", vec![
                         "-r", "-",
                         "-l",
                         "-t", "ad",
                         "-n",
-                        "-T", "fields",
-                        "-E", "separator=\t",
-                        "-e", "frame.time",
-                        "-e", "frame.interface_name",
-                        "-e", "frame.packet_flags_direction",
-                        "-e", "_ws.col.Source",
-                        "-e", "_ws.col.Destination",
-                        "-e", "_ws.col.Protocol",
-                        "-e", "_ws.col.Info",
+                        "-o", "gui.column.format:\
+\"Time\",\"%t\",\
+\"Iface\",\"%Cus:frame.interface_name:0:R\",\
+\"Dir\",\"%Cus:frame.packet_flags_direction:0:R\",\
+\"Source\",\"%s\",\
+\"Destination\",\"%d\",\
+\"Proto\",\"%p\",\
+\"Length\",\"%L\",\
+\"Info\",\"%i\"",
                     ])
                 } else {
                     ("tcpdump", vec!["-nn", "-r", "-"])
