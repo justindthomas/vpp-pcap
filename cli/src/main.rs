@@ -278,6 +278,12 @@ fn cmd_capture(sock: &PathBuf, opts: CaptureOpts) -> Result<()> {
                     // tab-separated fields. The %Cus:<field>:0:R
                     // form pulls a custom field; :R means
                     // "resolved" (formatted, not raw bytes).
+                    // tshark column-format mode. The Reason column
+                    // surfaces pcap-ng EPB comments (drop reason
+                    // for `-d drop` captures, empty for rx/tx).
+                    // tshark elides empty-string custom columns
+                    // gracefully so this single format works for
+                    // both modes.
                     ("tshark", vec![
                         "-r", "-",
                         "-l",
@@ -287,6 +293,7 @@ fn cmd_capture(sock: &PathBuf, opts: CaptureOpts) -> Result<()> {
 \"Time\",\"%t\",\
 \"Iface\",\"%Cus:frame.interface_name:0:R\",\
 \"Dir\",\"%Cus:frame.packet_flags_direction:0:R\",\
+\"Reason\",\"%Cus:frame.comment:0:R\",\
 \"Source\",\"%s\",\
 \"Destination\",\"%d\",\
 \"Proto\",\"%p\",\

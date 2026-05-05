@@ -12,34 +12,18 @@
  * "ip6-input.no-route") as a pcap-ng EPB comment so it surfaces in
  * the operator's output.
  *
- * Weak fallbacks are kept so the plugin can still load against
- * unpatched VPP (drop-mode just no-ops); the operator sees "drop"
- * sessions create successfully but capture nothing.
+ * The patched libvlib.so is a hard requirement — we don't ship
+ * weak no-op fallbacks. The earlier attempt did that and it
+ * silently broke at static link time: GCC resolved the call to the
+ * weak local stub before dlopen could redirect it to libvlib's
+ * strong symbol, so drop-mode looked alive but captured nothing.
+ * Now: if the symbol is missing at plugin load time, VPP fails to
+ * load the plugin (clear failure mode, easy to debug).
  */
 
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
 #include <pcap_stream/pcap_stream.h>
-
-extern void vlib_drop_callback_register (
-    void (*fn) (vlib_main_t *, vlib_buffer_t *, u32));
-extern void vlib_drop_callback_unregister (
-    void (*fn) (vlib_main_t *, vlib_buffer_t *, u32));
-
-/* Weak no-op fallbacks. Used if the patch isn't applied — the link
- * succeeds, drop-mode runs but never receives buffers. */
-__attribute__ ((weak)) void
-vlib_drop_callback_register (void (*fn) (vlib_main_t *, vlib_buffer_t *, u32))
-{
-  (void) fn;
-}
-
-__attribute__ ((weak)) void
-vlib_drop_callback_unregister (
-    void (*fn) (vlib_main_t *, vlib_buffer_t *, u32))
-{
-  (void) fn;
-}
 
 /* Format a human-readable drop reason from the encoded error.
  * Returns a freshly malloc'd string the caller frees. Format:
