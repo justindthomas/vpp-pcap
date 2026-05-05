@@ -45,9 +45,10 @@ enum Cmd {
     Stats {
         id: u32,
     },
-    /// Send a hex-encoded packet through every active session
-    /// (test path; bypasses the dataplane). Useful while the
-    /// feature-arc node is still under construction.
+    /// Send a hex-encoded packet through every active session,
+    /// bypassing the dataplane. Used by the integration test to
+    /// exercise the ring + drain + socket path against a known
+    /// payload without needing real traffic on a feature arc.
     Inject {
         /// Hex-encoded ethernet-framed packet bytes.
         hex: String,
@@ -56,7 +57,9 @@ enum Cmd {
 
 #[derive(Args, Debug, Default)]
 struct CaptureOpts {
-    /// Interface name (or "any"). Required for capture mode.
+    /// Interface name to capture on (e.g. `wan`, `lan.30`, `bvi100`),
+    /// or `any` to capture across every hardware/sub interface.
+    /// Defaults to `any` if omitted.
     #[arg(short = 'i', long)]
     interface: Option<String>,
 
@@ -80,7 +83,10 @@ struct CaptureOpts {
     #[arg(short = 'w', long)]
     write: Option<PathBuf>,
 
-    /// Pipe through `tcpdump -nn -r -` for human-readable decoding.
+    /// Pipe through `tshark` for human-readable decoding with a
+    /// VyOS-style aligned-column format that includes interface
+    /// name and direction (Inbound/Outbound). Falls back to
+    /// `tcpdump -nn -r -` if tshark isn't on PATH.
     #[arg(long)]
     print: bool,
 
