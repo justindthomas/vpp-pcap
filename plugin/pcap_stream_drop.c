@@ -25,43 +25,80 @@
 #include <vnet/vnet.h>
 #include <pcap_stream/pcap_stream.h>
 
-/* Format a human-readable drop reason from the encoded error.
- * Returns a freshly malloc'd string the caller frees. Format:
- * "<node-name>.<counter-name>" e.g. "ip6-input.no-route", which is
- * the same text vlib uses for `show errors`. Returns NULL if the
- * error can't be decoded (caller should skip the comment). */
-static char *
-format_drop_reason (vlib_main_t *vm, u32 error_index)
+/* Decoded drop info: node + counter strings plus a flag indicating
+ * which feature arc the drop fired on. Output-arc drops want the
+ * tx-side iface + an Outbound EPB flag; everything else gets the
+ * rx-side iface + Inbound. */
+typedef struct
+{
+  const char *node_name;	/* borrowed pointer into vlib_node_t */
+  const char *code_desc;	/* borrowed pointer into counters_heap */
+  int is_output_arc;
+} drop_info_t;
+
+/* Suffix-match against the set of node names that fire on output
+ * feature arcs / TX path. Conservative: matches only nodes where
+ * the buffer was being sent OUT a different interface than it came
+ * IN on. Common cases:
+ *   sfw-ip4-out, sfw-ip6-out      — sfw output feature arc
+ *   ip4-output, ip6-output        — pre-rewrite output node
+ *   ip4-rewrite, ip6-rewrite      — header rewrite (TTL, MTU drops)
+ *   ip4-arp, ip6-discover-neighbor — neighbour resolution drops
+ *   interface-output, *-tx        — final TX nodes (rare at error-
+ *                                   drop but covered for safety) */
+static int
+node_is_output_arc (const char *name)
+{
+  if (!name)
+    return 0;
+  size_t n = strlen (name);
+  /* Suffix helpers — only match if name is at least suffix length
+   * AND tail equals suffix. */
+#define ENDS(s)                                                               \
+  (n >= sizeof (s) - 1 && memcmp (name + n - (sizeof (s) - 1), (s),           \
+				  sizeof (s) - 1) == 0)
+  if (ENDS ("-out"))
+    return 1;
+  if (ENDS ("-output"))
+    return 1;
+  if (ENDS ("-rewrite"))
+    return 1;
+  if (ENDS ("-tx"))
+    return 1;
+#undef ENDS
+  if (strcmp (name, "ip4-arp") == 0)
+    return 1;
+  if (strcmp (name, "ip6-discover-neighbor") == 0)
+    return 1;
+  return 0;
+}
+
+/* Decode the encoded error into node + counter strings + arc hint.
+ * Returns 1 on success, 0 if the error can't be decoded (caller
+ * should skip the comment + leave direction as DROP-only). */
+static int
+decode_drop (vlib_main_t *vm, u32 error_index, drop_info_t *out)
 {
   vlib_error_main_t *em = &vm->error_main;
   uword node_index = vlib_error_get_node (&vm->node_main, error_index);
   uword code = vlib_error_get_code (&vm->node_main, error_index);
 
   if (node_index >= vec_len (vm->node_main.nodes))
-    return NULL;
+    return 0;
   vlib_node_t *n = vlib_get_node (vm, node_index);
   if (code >= n->n_errors)
-    return NULL;
+    return 0;
 
   uword counter_idx = n->error_heap_index + code;
   if (counter_idx >= vec_len (em->counters_heap))
-    return NULL;
+    return 0;
 
-  /* counters_heap[i].desc is a vlib-format vec (NUL-terminated by
-   * the format machinery). n->name is also a u8 vec. Build "<node>.
-   * <code>" with snprintf into a sane buffer. */
-  const char *node_name = (const char *) n->name;
-  const char *code_desc = em->counters_heap[counter_idx].desc;
-  if (!node_name || !code_desc)
-    return NULL;
-
-  char *out = NULL;
-  size_t want = strlen (node_name) + 1 + strlen (code_desc) + 1;
-  out = malloc (want);
-  if (!out)
-    return NULL;
-  snprintf (out, want, "%s.%s", node_name, code_desc);
-  return out;
+  out->node_name = (const char *) n->name;
+  out->code_desc = em->counters_heap[counter_idx].desc;
+  if (!out->node_name || !out->code_desc)
+    return 0;
+  out->is_output_arc = node_is_output_arc (out->node_name);
+  return 1;
 }
 
 static void
@@ -70,7 +107,39 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
   pcap_stream_main_t *psm = &pcap_stream_main;
   u32 thread_index = vm->thread_index;
   u32 orig_len = vlib_buffer_length_in_chain (vm, b);
-  u32 sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
+
+  /* Decode the drop reason first — its node-name suffix tells us
+   * whether to attribute the drop to the rx-side interface (input
+   * arc) or the tx-side (output arc). Output-arc drops use VLIB_TX
+   * if it's been populated; otherwise fall back to VLIB_RX so we
+   * always emit a usable iface. */
+  drop_info_t di;
+  int decoded = decode_drop (vm, error_index, &di);
+
+  u32 sw_if_index;
+  u8 epb_dir_bit;
+  if (decoded && di.is_output_arc)
+    {
+      u32 tx = vnet_buffer (b)->sw_if_index[VLIB_TX];
+      if (tx != ~0u && tx != 0)
+	{
+	  sw_if_index = tx;
+	  epb_dir_bit = PCAP_STREAM_DIR_TX;
+	}
+      else
+	{
+	  /* Output-arc drop but TX iface not set yet (e.g. rewrite
+	   * fired before the FIB lookup populated VLIB_TX) — fall back
+	   * to RX + Inbound. */
+	  sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
+	  epb_dir_bit = PCAP_STREAM_DIR_RX;
+	}
+    }
+  else
+    {
+      sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_RX];
+      epb_dir_bit = PCAP_STREAM_DIR_RX;
+    }
 
   /* Rewind to the L2 header so the captured frame is decodable
    * against the DLT_EN10MB IDB. Three cases:
@@ -121,8 +190,16 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
     }
 
   /* Format reason once per drop, regardless of how many sessions
-   * match. */
-  char *reason = format_drop_reason (vm, error_index);
+   * match. Borrowed pointers in di are stable for the life of the
+   * vlib registration so it's safe to read them across the loop. */
+  char reason_buf[96];
+  char *reason = NULL;
+  if (decoded)
+    {
+      snprintf (reason_buf, sizeof (reason_buf), "%s.%s", di.node_name,
+		di.code_desc);
+      reason = reason_buf;
+    }
 
   struct timespec ts;
   clock_gettime (CLOCK_REALTIME, &ts);
@@ -156,7 +233,10 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
       rec->sw_if_index = sw_if_index;
       rec->orig_len = orig_len;
       rec->len = first_seg_len < s->snaplen ? first_seg_len : s->snaplen;
-      rec->direction = PCAP_STREAM_DIR_DROP;
+      /* DROP bit drives session-direction filtering; the RX/TX bit
+       * tells the pcap-ng EPB encoder whether to mark Inbound or
+       * Outbound. */
+      rec->direction = PCAP_STREAM_DIR_DROP | epb_dir_bit;
       /* Stash drop reason in the record's reserved area so the
        * drain can emit it as a pcap-ng EPB comment. We bound the
        * length to keep records uniform — most drop reasons are
@@ -177,9 +257,6 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
       clib_memcpy_fast (pcap_stream_record_data (rec), pkt, rec->len);
       pcap_stream_ring_commit (r);
     }
-
-  if (reason)
-    free (reason);
 }
 
 void

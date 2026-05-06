@@ -259,11 +259,16 @@ pcap_stream_pcapng_emit_epb (pcap_stream_session_t *s, u32 sw_if_index,
   ((u16 *) (trailer + toff))[0] = PCAPNG_EPB_OPT_FLAGS;
   ((u16 *) (trailer + toff))[1] = 4;
   toff += 4;
+  /* direction is a bitmask in the per-record header — for live rx/tx
+   * it's a single bit (RX or TX); for drops it's DIR_DROP, optionally
+   * combined with RX or TX to encode which feature arc the drop fired
+   * on. Test the bits in priority order: TX wins (output-arc drop is
+   * an outbound observation), then RX, otherwise unknown. */
   u32 flags = 0;
-  if (direction == PCAP_STREAM_DIR_RX)
-    flags = PCAPNG_EPB_FLAGS_IN;
-  else if (direction == PCAP_STREAM_DIR_TX)
+  if (direction & PCAP_STREAM_DIR_TX)
     flags = PCAPNG_EPB_FLAGS_OUT;
+  else if (direction & PCAP_STREAM_DIR_RX)
+    flags = PCAPNG_EPB_FLAGS_IN;
   *((u32 *) (trailer + toff)) = flags;
   toff += 4;
   /* end-of-opt */
