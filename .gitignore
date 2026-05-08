@@ -1,3 +1,6 @@
+# audit pointer (file:line cites are borderline disclosure for public repos)
+.claude/audit.md
+
 # build outputs
 output/
 plugin/build/
