@@ -614,6 +614,12 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
 	  return 0;
 	}
       u8 *payload = clib_mem_alloc (pl);
+      if (!payload)
+	{
+	  free (hex);
+	  respond (c, "error reason=alloc_failed");
+	  return 0;
+	}
       for (size_t i = 0; i < pl; i++)
 	{
 	  unsigned int b;
@@ -791,6 +797,16 @@ drain_one_session (pcap_stream_session_t *s)
 	    }
 	  s->captured++;
 	  pcap_stream_ring_advance (r);
+
+	  /* Honour `-c N` / `max=N`. Closing the data fd is the
+	   * signal back to the CLI: its read loop sees EOF and
+	   * exits. session_destroy frees the session, so don't
+	   * touch s or r after this. */
+	  if (s->max_packets && s->captured >= s->max_packets)
+	    {
+	      pcap_stream_session_destroy (s);
+	      return;
+	    }
 	}
     }
 }

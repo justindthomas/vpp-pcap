@@ -93,12 +93,13 @@ emit_idb (int fd, u32 link_type, u32 snaplen, const char *name)
   /* Layout (all multiples of 4):
    *   header:        block_type(4) + total_len(4) = 8
    *   fixed body:    link_type(2)+reserved(2) + snaplen(4) = 8
-   *   if_name opt:   code(2)+len(2) + name_padded
+   *   if_name opt:   code(2)+len(2) + name_padded  (only if name_len > 0)
    *   tsresol opt:   code(2)+len(2) + 1byte+3pad = 8
    *   end opt:       code(2)+len(2) = 4
    *   trailer:       total_len(4) = 4
    */
-  u32 total_len = 8 + 8 + 4 + (u32) name_padded + 8 + 4 + 4;
+  u32 if_name_block = name_len > 0 ? 4 + (u32) name_padded : 0;
+  u32 total_len = 8 + 8 + if_name_block + 8 + 4 + 4;
 
   u8 buf[256]; /* worst case interface name fits */
   if (total_len > sizeof (buf))

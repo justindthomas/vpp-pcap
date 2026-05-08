@@ -208,7 +208,10 @@ pcap_stream_drop_callback (vlib_main_t *vm, vlib_buffer_t *b, u32 error_index)
   for (u32 i = 0; i < PCAP_STREAM_MAX_SESSIONS; i++)
     {
       pcap_stream_session_t *s = &psm->sessions[i];
-      if (!s->active)
+      /* See pcap_stream_node.c: acquire pairs with destroy's release store
+       * on s->active; the destroy-side worker barrier guarantees we won't
+       * deref bpf_eth / rings after they've been freed. */
+      if (!__atomic_load_n (&s->active, __ATOMIC_ACQUIRE))
 	continue;
       if (!(s->direction & PCAP_STREAM_DIR_DROP))
 	continue;

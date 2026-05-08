@@ -104,7 +104,11 @@ pcap_stream_match_and_enqueue (vlib_main_t *vm, vlib_buffer_t *b,
   for (u32 i = 0; i < PCAP_STREAM_MAX_SESSIONS; i++)
     {
       pcap_stream_session_t *s = &psm->sessions[i];
-      if (!s->active)
+      /* Acquire pairs with the release store in pcap_stream_session_destroy.
+       * If we observe active=1 here, all the bpf/rings fields written
+       * during create are visible to us. The destroy-side barrier is what
+       * keeps us out of UAF range once active flips back to 0. */
+      if (!__atomic_load_n (&s->active, __ATOMIC_ACQUIRE))
 	continue;
       if (!(s->direction & direction))
 	continue;

@@ -11,6 +11,7 @@
 
 #include <pcap_stream/pcap_stream.h>
 #include <vlib/file.h>
+#include <vlib/threads.h>
 #include <unistd.h>
 
 /* Compile both DLT_EN10MB and DLT_RAW programs so we can dispatch
@@ -194,7 +195,10 @@ pcap_stream_session_create (const char *filter_expr, u32 sw_if_index,
 	}
     }
 
-  s->active = 1;
+  /* Release pairs with the acquire load in pcap_stream_match_and_enqueue
+   * and pcap_stream_drop_callback — when a worker observes active=1,
+   * all the bpf/rings/snaplen fields written above are visible to it. */
+  __atomic_store_n (&s->active, 1, __ATOMIC_RELEASE);
   adjust_refcounts (s, 1);
   return s;
 }
@@ -205,7 +209,35 @@ pcap_stream_session_destroy (pcap_stream_session_t *s)
   if (!s || !s->active)
     return;
 
+  pcap_stream_main_t *psm = &pcap_stream_main;
+
+  /* Race against worker hot path: workers in pcap_stream_match_and_enqueue
+   * (rx/tx feature arc) and pcap_stream_drop_callback (drop path) read
+   * s->active, then dereference s->bpf_eth and s->rings[thread_index].
+   * Without ordering, a worker that just passed the active check could
+   * deref freed memory.
+   *
+   * Fix shape:
+   *   1. Clear active first with release ordering — workers entering
+   *      the hot path on the next iteration will skip this session.
+   *   2. Disable the feature-arc / drop-callback entry points so no
+   *      new worker invocations can reach the hot path at all.
+   *   3. Take a worker barrier — this waits until all workers reach a
+   *      safepoint, which in VPP is between frame dispatches. Any
+   *      worker that had already passed the active check completes
+   *      its in-flight frame before the barrier returns, so all reads
+   *      of bpf_eth/rings have drained by the time we free them.
+   *
+   * vnet_feature_enable_disable does NOT take a barrier internally, and
+   * vlib_drop_callback_unregister (the local vpp-patches hook) just
+   * vec_del1's the registration — neither drains in-flight callers. The
+   * explicit barrier is what makes the free below safe. */
+  __atomic_store_n (&s->active, 0, __ATOMIC_RELEASE);
+
   adjust_refcounts (s, -1);
+
+  vlib_worker_thread_barrier_sync (psm->vlib_main);
+  vlib_worker_thread_barrier_release (psm->vlib_main);
 
   /* clib_file_del closes the underlying fd (dont_close=0 default),
    * so when a file_index is registered we must NOT close
@@ -250,6 +282,4 @@ pcap_stream_session_destroy (pcap_stream_session_t *s)
       free (s->filter_expr);
       s->filter_expr = 0;
     }
-
-  s->active = 0;
 }
