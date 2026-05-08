@@ -639,7 +639,11 @@ parse_and_dispatch (pcap_stream_control_client_t *c, char *line)
       for (u32 i = 0; i < PCAP_STREAM_MAX_SESSIONS; i++)
 	{
 	  pcap_stream_session_t *s = &psm->sessions[i];
-	  if (!s->active)
+	  /* Relaxed is enough — inject and session_destroy are both
+	   * main-thread-only so there's no ordering concern, but using
+	   * an atomic load keeps the read shape consistent with the
+	   * worker hot paths in node.c / drop.c. */
+	  if (!__atomic_load_n (&s->active, __ATOMIC_RELAXED))
 	    continue;
 	  /* Filter against the ethernet program (DLT_EN10MB) — inject
 	   * always assumes ethernet-framed input. */
